@@ -75,6 +75,8 @@ test('two isolated browser players finish a real game; third player sees room fu
     }
     await expect(first.getByTestId('result-message')).toContainText(/胜|赢/);
     await expect(second.getByTestId('result-message')).toContainText(/输|负|败|胜/);
+    await first.getByTestId('drawing-skip').click();
+    await expect(first.getByTestId('board-canvas')).toBeVisible();
     await playAt(first, 8, 8);
     await expectMoveNo([first, second], 9);
     expect(thirdFrames.some((frame) => /room:snapshot|room:patch/.test(frame))).toBe(false);

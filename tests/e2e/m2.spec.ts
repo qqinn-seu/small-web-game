@@ -132,6 +132,9 @@ test('same players start another round only after both agree and exchange black 
       if (x < 4) { await move(b, x, 2); await moves([a, b], x * 2 + 2); }
     }
     await expect(a.getByTestId('result-message')).toContainText(/赢|胜/);
+    await expect(a.getByTestId('board-canvas')).toHaveAttribute('data-phase', 'drawing');
+    await a.getByTestId('drawing-skip').click();
+    await expect(a.getByTestId('board-canvas')).toHaveAttribute('data-phase', 'finished');
     await a.getByTestId('ready-button').click();
     await expect(a.getByTestId('board-canvas')).toHaveAttribute('data-phase', 'finished');
     await b.getByTestId('ready-button').click();
@@ -161,6 +164,8 @@ test('actively leaving resigns, frees the seat and lets a new player start a fre
     expect(await a.evaluate(() => localStorage.getItem('gomoku.room.v1'))).toBeNull();
     await joinRoom(replacement, roomCode, '新玩家');
     await expect(replacement.getByTestId('result-message')).not.toContainText(/你输了|本局失利|负：/);
+    await expect(b.getByTestId('board-canvas')).toHaveAttribute('data-phase', 'drawing');
+    await b.getByTestId('drawing-skip').click();
     await ready(b, replacement);
     await expect(replacement.locator('[data-seat="A"] .seat-color')).toHaveText('黑棋');
     await expect(b.locator('[data-seat="B"] .seat-color')).toHaveText('白棋');

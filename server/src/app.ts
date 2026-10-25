@@ -8,10 +8,16 @@ import { z } from 'zod';
 import {
   BOARD_CELLS,
   BOARD_SIZE,
+  BRUSH_COLORS,
+  DRAWING_DURATION_MS,
+  FACE_GRID_SIZE,
   NICKNAME_MAX_LENGTH,
   PROTOCOL_VERSION,
   RECONNECT_GRACE_MS,
   ROOM_IDLE_TTL_MS,
+  STROKE_BATCH_MAX_POINTS,
+  STROKE_MAX_INPUT_POINTS,
+  WASH_DURATION_MS,
 } from '../../shared/constants.js';
 import type {
   Cell,
@@ -37,9 +43,22 @@ import type {
   SessionData,
   SessionOpenRequest,
   SocketData,
+  StrokeBeginRequest,
+  StrokeEndRequest,
+  StrokePointsRequest,
   SyncRequest,
+  WashProposeRequest,
 } from '../../shared/protocol.js';
 import { isBoardFull, boardIndex, winningLineForMove } from './domain/rules.js';
+import {
+  acceptedBatchIsRateLimited,
+  archiveStroke,
+  canRetainFace,
+  createDrawing,
+  DrawingRuntimeStore,
+  ensureFace,
+} from './domain/drawing.js';
+import { clearProposedFaces, createWashProposal, washProposalStillMatches } from './domain/wash.js';
 import {
   clearReady,
   createRound,
@@ -182,6 +201,45 @@ const disconnectResolveSchema = z.object({
   targetPlayerId: opaqueIdSchema,
   decision: z.enum(['claim_win', 'keep_waiting']),
 }).strict();
+const pointSchema = z.object({
+  x: z.number().int().min(0).max(FACE_GRID_SIZE - 1),
+  y: z.number().int().min(0).max(FACE_GRID_SIZE - 1),
+}).strict();
+const drawingRequestSchema = z.object({
+  actionId: actionIdSchema,
+  roomInstanceId: opaqueIdSchema,
+  baseVersion: versionSchema,
+  roundId: opaqueIdSchema,
+  drawingId: opaqueIdSchema,
+}).strict();
+const strokeBeginSchema = drawingRequestSchema.extend({
+  strokeId: opaqueIdSchema,
+  colorIndex: z.number().int().min(0).max(BRUSH_COLORS.length - 1),
+  startPoint: pointSchema,
+}).strict();
+const strokePointsSchema = drawingRequestSchema.extend({
+  strokeId: opaqueIdSchema,
+  seq: z.number().int().min(1).max(STROKE_MAX_INPUT_POINTS),
+  points: z.array(pointSchema).min(1).max(STROKE_BATCH_MAX_POINTS),
+}).strict();
+const strokeEndSchema = drawingRequestSchema.extend({
+  strokeId: opaqueIdSchema,
+  lastSeq: z.number().int().min(0).max(STROKE_MAX_INPUT_POINTS),
+  pointCount: z.number().int().min(1).max(STROKE_MAX_INPUT_POINTS),
+}).strict();
+const washProposeSchema = z.object({
+  actionId: actionIdSchema,
+  roomInstanceId: opaqueIdSchema,
+  baseVersion: versionSchema,
+  roundId: z.string().min(12).max(128).nullable(),
+}).strict();
+const washRespondSchema = z.object({
+  actionId: actionIdSchema,
+  roomInstanceId: opaqueIdSchema,
+  baseVersion: versionSchema,
+  proposalId: opaqueIdSchema,
+  accept: z.boolean(),
+}).strict();
 
 function randomId(bytes: number): string {
   return randomBytes(bytes).toString('base64url');
@@ -303,6 +361,7 @@ export function createGameServer(options: CreateGameServerOptions = {}): GameSer
   // handoff still share one actionId reservation.
   const inFlightActions = new WeakMap<PlayerRecord, Map<string, InFlightAction>>();
   const memberOperations = new MemberOperations();
+  const drawingRuntimes = new DrawingRuntimeStore();
 
   const actionFingerprint = (event: string, hash: string): string => `${event}\u0000${hash}`;
 
@@ -365,6 +424,50 @@ export function createGameServer(options: CreateGameServerOptions = {}): GameSer
   const broadcastPatch = (room: RoomRecord, patch: PatchMessage, except?: GameSocket): void => {
     if (except === undefined) io.to(room.state.roomInstanceId).emit('room:patch', patch);
     else except.to(room.state.roomInstanceId).emit('room:patch', patch);
+  };
+
+  const playerNickname = (room: RoomRecord, playerId: string): string | undefined =>
+    store.players.get(playerId)?.nickname ?? seatForPlayer(room.state, playerId)?.nickname;
+
+  /** Starts the one-and-only drawing opportunity for a decisive round result. */
+  const startDrawingForResult = (room: RoomRecord): void => {
+    const round = room.state.round;
+    const winnerPlayerId = round?.result?.winnerPlayerId;
+    const targetPlayerId = round?.result?.loserPlayerId;
+    if (round === null || winnerPlayerId === null || winnerPlayerId === undefined || targetPlayerId === null || targetPlayerId === undefined) {
+      room.state.drawing = null;
+      room.state.phase = 'finished';
+      return;
+    }
+    room.state.phase = 'drawing';
+    room.state.drawing = createDrawing({
+      drawingId: randomId(ROUND_ID_BYTES),
+      roundId: round.roundId,
+      winnerPlayerId,
+      targetPlayerId,
+      winnerNickname: playerNickname(room, winnerPlayerId),
+      targetNickname: playerNickname(room, targetPlayerId),
+      deadlineAt: now() + DRAWING_DURATION_MS,
+    });
+    ensureFace(room.state, targetPlayerId);
+    drawingRuntimes.clear(room);
+  };
+
+  const expireDrawingIfNeeded = (room: RoomRecord, timestamp: number): PatchMessage | null => {
+    const drawing = room.state.drawing;
+    if (room.state.phase !== 'drawing' || drawing === null || timestamp < drawing.deadlineAt) return null;
+    drawingRuntimes.expire(room, drawing.drawingId);
+    room.state.phase = 'finished';
+    room.state.drawing = null;
+    room.state.washProposal = null;
+    return commit(room, { phase: room.state.phase, drawing: null, washProposal: null });
+  };
+
+  const cancelWashIfNeeded = (room: RoomRecord, timestamp: number): PatchMessage | null => {
+    const proposal = room.state.washProposal;
+    if (proposal === null || washProposalStillMatches(room.state, proposal, timestamp)) return null;
+    room.state.washProposal = null;
+    return commit(room, { washProposal: null });
   };
 
   const roomChanges = (room: RoomRecord, includeRound = false): RoomChanges => ({
@@ -458,6 +561,10 @@ export function createGameServer(options: CreateGameServerOptions = {}): GameSer
         store.removeRoom(room);
         continue;
       }
+      const drawingExpiryPatch = expireDrawingIfNeeded(room, timestamp);
+      if (drawingExpiryPatch !== null) broadcastPatch(room, drawingExpiryPatch);
+      const washCancellationPatch = cancelWashIfNeeded(room, timestamp);
+      if (washCancellationPatch !== null) broadcastPatch(room, washCancellationPatch);
       let eligibilityChanged = false;
       for (const seat of room.state.seats) {
         if (seat === null) continue;
@@ -483,6 +590,7 @@ export function createGameServer(options: CreateGameServerOptions = {}): GameSer
     schema: z.ZodType<T>,
     handler: (player: PlayerRecord, request: T) => Promise<AckResult<unknown>> | AckResult<unknown>,
     onCached?: (player: PlayerRecord, request: T, response: AckResult<unknown>) => Promise<void> | void,
+    ratePolicy: 'generic' | 'stroke-points' = 'generic',
   ): Promise<void> => {
     runMaintenance();
     const ack = socketAck(rawAck);
@@ -519,7 +627,10 @@ export function createGameServer(options: CreateGameServerOptions = {}): GameSer
       else ack(clone(await pending.response));
       return;
     }
-    if (rateLimited(socket)) {
+    // A sustained legitimate 25Hz drawing would exceed M2's generic 240/10s
+    // guard. Point batches are instead limited per active draft after duplicate
+    // seq detection; every other event retains the generic protection.
+    if (ratePolicy === 'generic' && rateLimited(socket)) {
       const response = failure(requestId, 'RATE_LIMITED', '请求过于频繁，请稍后重试。', true);
       cacheResponse(actor, event, requestId, hash, response);
       ack(response);
@@ -661,6 +772,7 @@ export function createGameServer(options: CreateGameServerOptions = {}): GameSer
       createdAt: timestamp,
       updatedAt: timestamp,
     };
+    ensureFace(state, player.playerId);
     const room = store.createRoom(state, player);
     if (room === null) return failure(request.actionId, 'RATE_LIMITED', '服务器暂时无法创建更多房间。', true);
     const lease = memberOperations.begin(room, player.playerId, socket.id, player.controlEpoch)!;
@@ -693,14 +805,19 @@ export function createGameServer(options: CreateGameServerOptions = {}): GameSer
     const seatIndex = room.state.seats.findIndex((seat) => seat === null);
     if (seatIndex === -1) return failure(request.actionId, 'ROOM_FULL', '房间已满，请创建新房间。');
 
+    if (!canRetainFace(room.state, player.playerId)) {
+      return failure(request.actionId, 'RATE_LIMITED', '本房间已保留64名玩家的脸。为保护旧图案，请创建新房间。');
+    }
     const lease = memberOperations.begin(room, player.playerId, socket.id, player.controlEpoch);
     if (lease === null) return failure(request.actionId, 'INVALID_PHASE', '成员操作正在处理中，请稍候。', true);
+    const hadFace = room.state.faces[player.playerId] !== undefined;
+    ensureFace(room.state, player.playerId);
     const previousNoConnectedPlayersSince = room.state.noConnectedPlayersSince;
     const seatId: SeatId = seatIndex === 0 ? 'A' : 'B';
     room.state.seats[seatIndex] = publicSeat(seatId, player);
     player.roomInstanceId = room.state.roomInstanceId;
     updateNoConnectedPlayersSince(room.state, now());
-    const reservationPatch = commit(room, roomChanges(room), request.actionId);
+    const reservationPatch = commit(room, { ...roomChanges(room), faces: clone(room.state.faces) }, request.actionId);
     // Existing authorized members learn the reservation before join awaits. The
     // pending gate prevents the not-yet-joined socket from acting on it.
     broadcastPatch(room, reservationPatch);
@@ -716,9 +833,10 @@ export function createGameServer(options: CreateGameServerOptions = {}): GameSer
       }
       room.state.seats[seatIndex] = null;
       player.roomInstanceId = null;
+      if (!hadFace) delete room.state.faces[player.playerId];
       room.state.noConnectedPlayersSince = previousNoConnectedPlayersSince;
       updateNoConnectedPlayersSince(room.state, now());
-      const rollbackPatch = commit(room, roomChanges(room), request.actionId);
+      const rollbackPatch = commit(room, { ...roomChanges(room), faces: clone(room.state.faces) }, request.actionId);
       broadcastPatch(room, rollbackPatch);
       memberOperations.finish(room, player.playerId, lease);
       return failure(request.actionId, 'INTERNAL_ERROR', '加入房间失败。', true);
@@ -845,8 +963,11 @@ export function createGameServer(options: CreateGameServerOptions = {}): GameSer
       const round = createRound(room.state.round, [seatA, seatB], randomId(ROUND_ID_BYTES));
       room.state.phase = 'playing';
       room.state.round = round;
+      room.state.drawing = null;
+      room.state.washProposal = null;
+      drawingRuntimes.clear(room);
       clearReady(room.state);
-      changes = { phase: room.state.phase, ...roomChanges(room, true) };
+      changes = { phase: room.state.phase, drawing: null, ...roomChanges(room, true) };
     }
     const patch = commit(room, changes, request.actionId);
     broadcastPatch(room, patch);
@@ -881,15 +1002,21 @@ export function createGameServer(options: CreateGameServerOptions = {}): GameSer
         winningLine,
         endedAt: now(),
       };
-      room.state.phase = 'finished';
+      startDrawingForResult(room);
     } else if (isBoardFull(round.board)) {
       round.turnPlayerId = null;
       round.result = { winnerPlayerId: null, loserPlayerId: null, reason: 'draw', winningLine: [], endedAt: now() };
       room.state.phase = 'finished';
+      room.state.drawing = null;
+      drawingRuntimes.clear(room);
     } else {
       round.turnPlayerId = round.participantIds.find((participantId) => participantId !== player.playerId) ?? null;
     }
-    const patch = commit(room, { phase: room.state.phase, round: clone(round) }, request.actionId);
+    const patch = commit(room, {
+      phase: room.state.phase,
+      round: clone(round),
+      ...(room.state.drawing === null ? { drawing: null } : { drawing: clone(room.state.drawing), faces: clone(room.state.faces) }),
+    }, request.actionId);
     broadcastPatch(room, patch);
     return success(request.actionId, undefined, patch.version);
   };
@@ -932,14 +1059,19 @@ export function createGameServer(options: CreateGameServerOptions = {}): GameSer
       winningLine: [],
       endedAt: now(),
     };
-    room.state.phase = 'finished';
+    startDrawingForResult(room);
     const targetPlayer = store.players.get(request.targetPlayerId);
     const targetIndex = seatIndexForPlayer(room.state, request.targetPlayerId);
     if (targetIndex !== -1) room.state.seats[targetIndex] = null;
     if (targetPlayer?.roomInstanceId === room.state.roomInstanceId) targetPlayer.roomInstanceId = null;
     clearReady(room.state);
     updateNoConnectedPlayersSince(room.state, now());
-    const patch = commit(room, { phase: room.state.phase, ...roomChanges(room, true) }, request.actionId);
+    const patch = commit(room, {
+      phase: room.state.phase,
+      drawing: clone(room.state.drawing),
+      faces: clone(room.state.faces),
+      ...roomChanges(room, true),
+    }, request.actionId);
     broadcastPatch(room, patch);
     return success(request.actionId, undefined, patch.version);
   };
@@ -993,6 +1125,13 @@ export function createGameServer(options: CreateGameServerOptions = {}): GameSer
         winningLine: [],
         endedAt: now(),
       };
+      startDrawingForResult(room);
+    } else if (room.state.phase === 'drawing' && room.state.drawing?.winnerPlayerId === player.playerId) {
+      // The controller who owns the sole drawing opportunity has explicitly
+      // left. Its unconfirmed draft must never be archived after a replacement
+      // joins the vacant seat.
+      drawingRuntimes.clear(room);
+      room.state.drawing = null;
       room.state.phase = 'finished';
     }
     room.state.seats[leavingIndex] = null;
@@ -1002,10 +1141,211 @@ export function createGameServer(options: CreateGameServerOptions = {}): GameSer
     updateNoConnectedPlayersSince(room.state, now());
     const patch = commit(room, {
       ...(room.state.phase === 'playing' ? {} : { phase: room.state.phase }),
+      ...(room.state.phase === 'drawing' ? { drawing: clone(room.state.drawing), faces: clone(room.state.faces) } : {}),
+      ...(room.state.phase === 'finished' ? { drawing: null } : {}),
       ...roomChanges(room, round !== null),
     }, request.actionId);
     broadcastPatch(room, patch);
     memberOperations.finish(room, player.playerId, lease);
+    return success(request.actionId, undefined, patch.version);
+  };
+
+  const activeDrawingFor = (
+    room: RoomRecord,
+    player: PlayerRecord,
+    request: { actionId: string; roundId: string; drawingId: string },
+  ): NonNullable<RoomState['drawing']> | AckResult<never> => {
+    const round = room.state.round;
+    if (round === null || round.roundId !== request.roundId) {
+      return failure(request.actionId, 'STALE_ROUND', '该对局已经过期。', false, true);
+    }
+    const drawing = room.state.drawing;
+    if (room.state.phase !== 'drawing' || drawing === null) {
+      if (drawingRuntimes.isExpired(room, request.drawingId)) {
+        return failure(request.actionId, 'DRAWING_EXPIRED', '画脸期限已结束。', false, true);
+      }
+      return failure(request.actionId, 'INVALID_PHASE', '当前阶段不能画脸。', false, true);
+    }
+    if (drawing.drawingId !== request.drawingId) {
+      return drawingRuntimes.isExpired(room, request.drawingId)
+        ? failure(request.actionId, 'DRAWING_EXPIRED', '画脸期限已结束。', false, true)
+        : failure(request.actionId, 'STALE_ROUND', '画脸会话已经过期。', false, true);
+    }
+    if (now() >= drawing.deadlineAt) {
+      const patch = expireDrawingIfNeeded(room, now());
+      if (patch !== null) broadcastPatch(room, patch);
+      return failure(request.actionId, 'DRAWING_EXPIRED', '画脸期限已结束。', false, true);
+    }
+    if (drawing.winnerPlayerId !== player.playerId) {
+      return failure(request.actionId, 'NOT_YOUR_TURN', '只有本局胜者可以画脸。', false, true);
+    }
+    return drawing;
+  };
+
+  const isDrawingFailure = (
+    value: NonNullable<RoomState['drawing']> | AckResult<never>,
+  ): value is AckResult<never> => !('drawingId' in value);
+
+  const beginStroke = (socket: GameSocket, player: PlayerRecord, request: StrokeBeginRequest): AckResult => {
+    const member = memberRoom(socket, player, request.roomInstanceId, request.actionId);
+    if (isRoomFailure(member)) return member;
+    const room = member;
+    const drawing = activeDrawingFor(room, player, request);
+    if (isDrawingFailure(drawing)) return drawing;
+    if (drawing.strokeUsed || drawing.draft !== null) {
+      return failure(request.actionId, 'INVALID_PHASE', '本次画脸机会已经使用。', false, true);
+    }
+    drawing.strokeUsed = true;
+    drawing.draft = {
+      strokeId: request.strokeId,
+      colorIndex: request.colorIndex,
+      points: [{ ...request.startPoint }],
+      lastSeq: 0,
+    };
+    drawingRuntimes.start(room, drawing.drawingId, request.strokeId);
+    const patch = commit(room, { drawing: clone(drawing) }, request.actionId);
+    broadcastPatch(room, patch);
+    return success(request.actionId, undefined, patch.version);
+  };
+
+  const addStrokePoints = (socket: GameSocket, player: PlayerRecord, request: StrokePointsRequest): AckResult => {
+    const member = memberRoom(socket, player, request.roomInstanceId, request.actionId);
+    if (isRoomFailure(member)) return member;
+    const room = member;
+    const drawing = activeDrawingFor(room, player, request);
+    if (isDrawingFailure(drawing)) return drawing;
+    const draft = drawing.draft;
+    const runtime = drawingRuntimes.get(room);
+    if (draft === null || draft.strokeId !== request.strokeId || runtime === undefined || runtime.drawingId !== drawing.drawingId
+      || runtime.strokeId !== request.strokeId) {
+      return failure(request.actionId, 'INVALID_STROKE_SEQ', '笔画会话已经过期。', false, true);
+    }
+    const batchHash = payloadHash({ seq: request.seq, points: request.points });
+    if (request.seq <= draft.lastSeq) {
+      if (runtime.batchHashes.get(request.seq) === batchHash) {
+        return success(request.actionId, undefined, room.state.version);
+      }
+      return failure(request.actionId, 'INVALID_STROKE_SEQ', '重复序号的笔画内容不一致。', false, true);
+    }
+    if (request.seq !== draft.lastSeq + 1) {
+      return failure(request.actionId, 'INVALID_STROKE_SEQ', '笔画批次序号必须连续。', true, true);
+    }
+    if (draft.points.length + request.points.length > STROKE_MAX_INPUT_POINTS) {
+      return failure(request.actionId, 'INVALID_PAYLOAD', '单笔输入点不能超过 1024 个。');
+    }
+    if (acceptedBatchIsRateLimited(runtime, now())) {
+      return failure(request.actionId, 'RATE_LIMITED', '画笔批次过于频繁，请稍后重试。', true, true);
+    }
+    draft.points.push(...request.points.map((point) => ({ ...point })));
+    draft.lastSeq = request.seq;
+    runtime.batchHashes.set(request.seq, batchHash);
+    const patch = commit(room, { drawing: clone(drawing) }, request.actionId);
+    broadcastPatch(room, patch);
+    return success(request.actionId, undefined, patch.version);
+  };
+
+  const endStroke = (socket: GameSocket, player: PlayerRecord, request: StrokeEndRequest): AckResult => {
+    const member = memberRoom(socket, player, request.roomInstanceId, request.actionId);
+    if (isRoomFailure(member)) return member;
+    const room = member;
+    const drawing = activeDrawingFor(room, player, request);
+    if (isDrawingFailure(drawing)) return drawing;
+    const draft = drawing.draft;
+    if (draft === null || draft.strokeId !== request.strokeId) {
+      return failure(request.actionId, 'INVALID_STROKE_SEQ', '笔画会话已经过期。', false, true);
+    }
+    if (request.lastSeq !== draft.lastSeq || request.pointCount !== draft.points.length) {
+      return failure(request.actionId, 'INVALID_STROKE_SEQ', '笔画结束信息与已确认批次不一致。', true, true);
+    }
+    archiveStroke(room.state, drawing);
+    drawingRuntimes.clear(room);
+    room.state.drawing = null;
+    room.state.phase = 'finished';
+    const patch = commit(room, { phase: room.state.phase, drawing: null, faces: clone(room.state.faces) }, request.actionId);
+    broadcastPatch(room, patch);
+    return success(request.actionId, undefined, patch.version);
+  };
+
+  const skipDrawing = (socket: GameSocket, player: PlayerRecord, request: { actionId: string; roomInstanceId: string; roundId: string; drawingId: string }): AckResult => {
+    const member = memberRoom(socket, player, request.roomInstanceId, request.actionId);
+    if (isRoomFailure(member)) return member;
+    const room = member;
+    const drawing = activeDrawingFor(room, player, request);
+    if (isDrawingFailure(drawing)) return drawing;
+    drawingRuntimes.clear(room);
+    room.state.drawing = null;
+    room.state.phase = 'finished';
+    const patch = commit(room, { phase: room.state.phase, drawing: null }, request.actionId);
+    broadcastPatch(room, patch);
+    return success(request.actionId, undefined, patch.version);
+  };
+
+  const proposeWash = (socket: GameSocket, player: PlayerRecord, request: WashProposeRequest): AckResult => {
+    const member = memberRoom(socket, player, request.roomInstanceId, request.actionId);
+    if (isRoomFailure(member)) return member;
+    const room = member;
+    if (room.state.phase !== 'waiting' && room.state.phase !== 'finished') {
+      return failure(request.actionId, 'INVALID_PHASE', '当前阶段不能洗脸。', false, true);
+    }
+    if (room.pendingMemberPlayerIds.size > 0) {
+      return failure(request.actionId, 'GAME_PAUSED', '成员正在切换连接或离开，请稍后重试。', true);
+    }
+    if (request.roundId !== (room.state.round?.roundId ?? null)) {
+      return failure(request.actionId, 'STALE_ROUND', '洗脸请求引用了过期对局。', false, true);
+    }
+    const [seatA, seatB] = room.state.seats;
+    if (seatA === null || seatB === null || !seatA.connected || !seatB.connected) {
+      return failure(request.actionId, 'GAME_PAUSED', '洗脸需要两位当前玩家同时在线。', true, true);
+    }
+    if (room.state.washProposal !== null) {
+      return failure(request.actionId, 'INVALID_PHASE', '已有待回应的洗脸请求。', false, true);
+    }
+    room.state.washProposal = createWashProposal({
+      proposalId: randomId(ROUND_ID_BYTES),
+      proposerPlayerId: player.playerId,
+      participantIds: [seatA.playerId, seatB.playerId],
+      state: room.state,
+      deadlineAt: now() + WASH_DURATION_MS,
+    });
+    const patch = commit(room, { washProposal: clone(room.state.washProposal) }, request.actionId);
+    broadcastPatch(room, patch);
+    return success(request.actionId, undefined, patch.version);
+  };
+
+  const respondWash = (
+    socket: GameSocket,
+    player: PlayerRecord,
+    request: { actionId: string; roomInstanceId: string; proposalId: string; accept: boolean },
+  ): AckResult => {
+    const member = memberRoom(socket, player, request.roomInstanceId, request.actionId);
+    if (isRoomFailure(member)) return member;
+    const room = member;
+    const proposal = room.state.washProposal;
+    if (proposal === null || proposal.proposalId !== request.proposalId) {
+      return failure(request.actionId, 'INVALID_PHASE', '洗脸请求已经过期。', false, true);
+    }
+    if (room.pendingMemberPlayerIds.size > 0) {
+      return failure(request.actionId, 'GAME_PAUSED', '成员正在离开或切换连接，暂时不能确认洗脸。', true, true);
+    }
+    if (!washProposalStillMatches(room.state, proposal, now())) {
+      room.state.washProposal = null;
+      const patch = commit(room, { washProposal: null }, request.actionId);
+      broadcastPatch(room, patch);
+      return failure(request.actionId, 'INVALID_PHASE', '洗脸请求已经过期。', false, true);
+    }
+    if (player.playerId === proposal.proposerPlayerId || !proposal.participantIds.includes(player.playerId)) {
+      return failure(request.actionId, 'NOT_YOUR_TURN', '只有另一位提议参与者可以回应洗脸。', false, true);
+    }
+    if (!request.accept) {
+      room.state.washProposal = null;
+      const patch = commit(room, { washProposal: null }, request.actionId);
+      broadcastPatch(room, patch);
+      return success(request.actionId, undefined, patch.version);
+    }
+    clearProposedFaces(room.state, proposal);
+    room.state.washProposal = null;
+    const patch = commit(room, { faces: clone(room.state.faces), washProposal: null }, request.actionId);
+    broadcastPatch(room, patch);
     return success(request.actionId, undefined, patch.version);
   };
 
@@ -1066,6 +1406,33 @@ export function createGameServer(options: CreateGameServerOptions = {}): GameSer
     });
     gameSocket.on('disconnect:resolve', (request, ack) => {
       void runAuthenticated(gameSocket, 'disconnect:resolve', request, ack, disconnectResolveSchema, (player, parsed) => resolveDisconnect(gameSocket, player, parsed));
+    });
+    gameSocket.on('stroke:begin', (request, ack) => {
+      void runAuthenticated(gameSocket, 'stroke:begin', request, ack, strokeBeginSchema, (player, parsed) => beginStroke(gameSocket, player, parsed));
+    });
+    gameSocket.on('stroke:points', (request, ack) => {
+      void runAuthenticated(
+        gameSocket,
+        'stroke:points',
+        request,
+        ack,
+        strokePointsSchema,
+        (player, parsed) => addStrokePoints(gameSocket, player, parsed),
+        undefined,
+        'stroke-points',
+      );
+    });
+    gameSocket.on('stroke:end', (request, ack) => {
+      void runAuthenticated(gameSocket, 'stroke:end', request, ack, strokeEndSchema, (player, parsed) => endStroke(gameSocket, player, parsed));
+    });
+    gameSocket.on('drawing:skip', (request, ack) => {
+      void runAuthenticated(gameSocket, 'drawing:skip', request, ack, drawingRequestSchema, (player, parsed) => skipDrawing(gameSocket, player, parsed));
+    });
+    gameSocket.on('wash:propose', (request, ack) => {
+      void runAuthenticated(gameSocket, 'wash:propose', request, ack, washProposeSchema, (player, parsed) => proposeWash(gameSocket, player, parsed));
+    });
+    gameSocket.on('wash:respond', (request, ack) => {
+      void runAuthenticated(gameSocket, 'wash:respond', request, ack, washRespondSchema, (player, parsed) => respondWash(gameSocket, player, parsed));
     });
     gameSocket.on('disconnect', () => disconnect(gameSocket));
   });

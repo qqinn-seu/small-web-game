@@ -282,6 +282,14 @@ README限制：纯内存，重启/休眠丢房间；免费唤醒慢；不支持�
 
 M2尚未实现画脸，因此五连、主动认输和超时裁决暂时直接进入finished；M3再接入已确定的drawing环节。60秒裁决只适用于playing阶段；waiting/finished不追溯改写结果，也不自动释放保留座位，玩家可恢复或在线方主动离开另建房间。任意阶段双方连续离线10分钟销毁房间。
 
+### M3 实现细化
+
+累计`FaceCanvas.pixels`为1024个整数：`-1`透明，`0–5`对应固定六色。它保存全部确认笔迹，原始`strokes`仅保留最近4条，旧轨迹压平后视觉不丢失。前后端共享整数Bresenham插值，固定一格粗细。`stroke:begin`的起点计入总点数、`lastSeq=0`，之后批次从`seq=1`连续递增，`stroke:end.pointCount`是起点与全部已接收输入点总数。
+
+`wash:propose.roundId`允许首局waiting时为null，其他情况绑定当前roundId；洗脸仍仅允许waiting/finished两人在线，不能单方清空。drawing额外冻结胜者和原输家昵称，替换座位不会改变结算目标。M3只加入静态像素脸作为绘画载体，完整小人动画和音效仍属于M4。
+
+纯内存资源保护：单房间保留至多64个历史身份画布，容量包含当前两席。达到上限拒绝全新身份加入，并提示创建新房间；不删除任何既有画布，原有效身份仍可进入空座并恢复笔迹。双方同意洗脸只清图案，不改变身份归属或容量计数。
+
 ## References
 
 [1]: https://socket.io/docs/v4/delivery-guarantees "Socket.IO Delivery guarantees"

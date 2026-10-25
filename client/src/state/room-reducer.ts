@@ -1,4 +1,14 @@
-import type { PatchMessage, RoomState, SnapshotMessage } from '../../../shared/models.js';
+import type {
+  FaceCanvas,
+  PatchMessage,
+  PublicDrawing,
+  PublicRound,
+  RoomChanges,
+  RoomState,
+  SnapshotMessage,
+  StoredStroke,
+  WashProposal,
+} from '../../../shared/models.js';
 
 /**
  * Pure room-state transitions. The client only adopts state sent by the server;
@@ -20,36 +30,79 @@ export interface SnapshotReduceOptions {
   replaceAtSameVersion?: boolean;
 }
 
+function cloneStroke(stroke: StoredStroke): StoredStroke {
+  return { ...stroke, points: stroke.points.map((point) => ({ ...point })) };
+}
+
+function cloneFace(face: FaceCanvas): FaceCanvas {
+  return {
+    ...face,
+    pixels: [...face.pixels],
+    strokes: face.strokes.map(cloneStroke),
+  };
+}
+
+function cloneFaces(faces: Record<string, FaceCanvas>): Record<string, FaceCanvas> {
+  return Object.fromEntries(Object.entries(faces).map(([playerId, face]) => [playerId, cloneFace(face)]));
+}
+
+function cloneRound(round: PublicRound | null): PublicRound | null {
+  if (!round) return null;
+  return {
+    ...round,
+    participantIds: [...round.participantIds] as PublicRound['participantIds'],
+    board: [...round.board],
+    lastMove: round.lastMove ? { ...round.lastMove } : null,
+    result: round.result
+      ? {
+          ...round.result,
+          winningLine: round.result.winningLine.map((point) => ({ ...point })),
+        }
+      : null,
+  };
+}
+
+function cloneDrawing(drawing: PublicDrawing | null): PublicDrawing | null {
+  if (!drawing) return null;
+  return {
+    ...drawing,
+    draft: drawing.draft
+      ? { ...cloneStroke(drawing.draft), lastSeq: drawing.draft.lastSeq }
+      : null,
+  };
+}
+
+function cloneWashProposal(proposal: WashProposal | null): WashProposal | null {
+  if (!proposal) return null;
+  return {
+    ...proposal,
+    participantIds: [...proposal.participantIds] as WashProposal['participantIds'],
+    faceRevisions: [...proposal.faceRevisions] as WashProposal['faceRevisions'],
+  };
+}
+
+/** Copy optional full patch children before they enter the browser state mirror. */
+function cloneChanges(changes: RoomChanges): RoomChanges {
+  const result: RoomChanges = { ...changes };
+  if (changes.seats) result.seats = changes.seats.map((seat) => (seat ? { ...seat } : null)) as RoomState['seats'];
+  if (changes.round !== undefined) result.round = cloneRound(changes.round);
+  if (changes.faces !== undefined) result.faces = cloneFaces(changes.faces);
+  if (changes.drawing !== undefined) result.drawing = cloneDrawing(changes.drawing);
+  if (changes.washProposal !== undefined) result.washProposal = cloneWashProposal(changes.washProposal);
+  return result;
+}
+
 function cloneSnapshotState(message: SnapshotMessage): RoomState {
   const state = message.state;
   return {
     ...state,
     roomInstanceId: message.roomInstanceId,
     version: message.version,
-    seats: [...state.seats],
-    round: state.round
-      ? {
-          ...state.round,
-          board: [...state.round.board],
-          lastMove: state.round.lastMove ? { ...state.round.lastMove } : null,
-          result: state.round.result
-            ? {
-                ...state.round.result,
-                winningLine: state.round.result.winningLine.map((point) => ({ ...point })),
-              }
-            : null,
-        }
-      : null,
-    faces: { ...state.faces },
-    drawing: state.drawing
-      ? {
-          ...state.drawing,
-          draft: state.drawing.draft
-            ? { ...state.drawing.draft, points: state.drawing.draft.points.map((point) => ({ ...point })) }
-            : null,
-        }
-      : null,
-    washProposal: state.washProposal ? { ...state.washProposal } : null,
+    seats: state.seats.map((seat) => (seat ? { ...seat } : null)) as RoomState['seats'],
+    round: cloneRound(state.round),
+    faces: cloneFaces(state.faces),
+    drawing: cloneDrawing(state.drawing),
+    washProposal: cloneWashProposal(state.washProposal),
   };
 }
 
@@ -73,8 +126,8 @@ export function reduceSnapshot(
 
 /**
  * Atomically apply one protocol patch. Every member inside `changes` is a full
- * public child object supplied by the server, so shallow replacement is
- * deliberate: nested data must never be client-side merged.
+ * public child object supplied by the server, so replacement remains
+ * authoritative while copying protects the mirror from future message mutation.
  */
 export function reducePatch(current: RoomState | null, message: PatchMessage): RoomReducerResult {
   if (!current || current.roomInstanceId !== message.roomInstanceId) {
@@ -89,7 +142,7 @@ export function reducePatch(current: RoomState | null, message: PatchMessage): R
 
   const next: RoomState = {
     ...current,
-    ...message.changes,
+    ...cloneChanges(message.changes),
     roomInstanceId: message.roomInstanceId,
     version: message.version,
   };

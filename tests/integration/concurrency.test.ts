@@ -80,6 +80,9 @@ describe('M2 member-operation concurrency', () => {
       expect((await request(a, 'game:move', { actionId: id(), roomInstanceId: entry.roomInstanceId, baseVersion: 0, roundId, x, y: 0, expectedMoveNo: x * 2 })).ok).toBe(true);
       if (x < 4) expect((await request(b, 'game:move', { actionId: id(), roomInstanceId: entry.roomInstanceId, baseVersion: 0, roundId, x, y: 2, expectedMoveNo: x * 2 + 1 })).ok).toBe(true);
     }
+    expect((await request(a, 'drawing:skip', {
+      actionId: id(), roomInstanceId: entry.roomInstanceId, baseVersion: 0, roundId, drawingId: state.drawing!.drawingId,
+    })).ok).toBe(true);
     await ready(a, entry, roundId);
     const serverA = game.io.sockets.sockets.get(a.id!)!;
     const original = serverA.leave.bind(serverA);
@@ -110,6 +113,9 @@ describe('M2 member-operation concurrency', () => {
       expect((await request(a, 'game:move', { actionId: id(), roomInstanceId: entry.roomInstanceId, baseVersion: 0, roundId, x, y: 0, expectedMoveNo: x * 2 })).ok).toBe(true);
       if (x < 4) expect((await request(b, 'game:move', { actionId: id(), roomInstanceId: entry.roomInstanceId, baseVersion: 0, roundId, x, y: 2, expectedMoveNo: x * 2 + 1 })).ok).toBe(true);
     }
+    expect((await request(a, 'drawing:skip', {
+      actionId: id(), roomInstanceId: entry.roomInstanceId, baseVersion: 0, roundId, drawingId: state.drawing!.drawingId,
+    })).ok).toBe(true);
     await ready(a, entry, roundId);
     const serverA = game.io.sockets.sockets.get(a.id!)!;
     const original = serverA.leave.bind(serverA);

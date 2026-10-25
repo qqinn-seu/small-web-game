@@ -212,13 +212,19 @@ describe('M1 game server', () => {
     expect((await move(context.b, context.roomInstanceId, round.roundId, 7, 3, 1)).ok).toBe(true);
     expect((await move(context.a, context.roomInstanceId, round.roundId, 8, 4, 0)).ok).toBe(true);
 
-    await eventually(() => context.bObserver.state?.phase === 'finished', 'winning patch did not reach opponent');
+    await eventually(() => context.bObserver.state?.phase === 'drawing', 'winning drawing patch did not reach opponent');
     expect(context.bObserver.state?.round?.result).toMatchObject({
       winnerPlayerId: context.aSession.playerId,
       loserPlayerId: context.bSession.playerId,
       reason: 'five',
     });
     expect(context.bObserver.state?.round?.result?.winningLine).toHaveLength(5);
+    expect(context.bObserver.state?.drawing).toMatchObject({
+      winnerPlayerId: context.aSession.playerId,
+      targetPlayerId: context.bSession.playerId,
+      winnerNickname: 'Alice',
+      targetNickname: 'Bob',
+    });
 
     const syncRequestId = 'sync-request-0001';
     const synced = await request(context.b, 'room:sync', {
@@ -278,7 +284,7 @@ describe('M1 game server', () => {
     expect((await move(context.a, context.roomInstanceId, round.roundId, 6, 3, 0)).ok).toBe(true);
     expect((await move(context.b, context.roomInstanceId, round.roundId, 7, 3, 1)).ok).toBe(true);
     expect((await move(context.a, context.roomInstanceId, round.roundId, 8, 4, 0)).ok).toBe(true);
-    await eventually(() => context.aObserver.state?.phase === 'finished', 'game did not finish');
+    await eventually(() => context.aObserver.state?.phase === 'drawing', 'game did not enter drawing');
 
     const afterWin = await move(context.b, context.roomInstanceId, round.roundId, 9, 4, 1);
     expect(afterWin).toMatchObject({ ok: false, errorCode: 'INVALID_PHASE' });

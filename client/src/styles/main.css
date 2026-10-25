@@ -103,6 +103,12 @@ button.secondary:not(:disabled):hover { background: #d6e5dc; }
 .seat-online { font-size: 12px; color: #2d8264; }
 .seat-online.offline { color: #8c6f61; }
 .seat-ready { font-size: 12px; color: #637871; margin-top: 8px; }
+.seat-person { display: flex; align-items: center; gap: 11px; margin-top: 9px; }
+.seat-person .seat-bottom { min-width: 0; flex: 1; display: block; }
+.face-canvas {
+  display: block; width: 54px; height: 54px; flex: 0 0 54px; border: 1px solid #bdcfc4;
+  border-radius: 9px; background: #f1c6a9; image-rendering: pixelated;
+}
 
 .turn-card { border-radius: 13px; background: #173b36; color: #f7fbf8; padding: 14px; }
 .turn-label { display: block; font-weight: 750; line-height: 1.45; }
@@ -113,6 +119,15 @@ button.secondary:not(:disabled):hover { background: #d6e5dc; }
 .leave-button { width: 100%; }
 .disconnect-actions { grid-template-columns: 1fr 1fr; }
 .disconnect-actions button { min-width: 0; font-size: 13px; padding-inline: 10px; }
+
+.wash-panel { padding: 14px; }
+.wash-heading { display: grid; gap: 3px; }
+.wash-heading strong { font-size: 14px; }
+.wash-heading span, .wash-status { color: #60746d; font-size: 12px; line-height: 1.5; }
+.wash-status { min-height: 18px; margin: 9px 0; }
+.wash-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.wash-actions button { min-height: 37px; font-size: 13px; }
+
 .board-panel { overflow: hidden; padding: 14px; }
 .board-canvas {
   display: block; width: min(100%, 680px); aspect-ratio: 1; margin: 0 auto;
@@ -122,9 +137,31 @@ button.secondary:not(:disabled):hover { background: #d6e5dc; }
 .board-caption { display: flex; justify-content: space-between; gap: 8px; padding: 11px 3px 1px; color: #5c7069; font-size: 13px; }
 .pending-move { color: #a54c25; font-weight: 750; }
 .result-message {
-  margin: 2px 3px 0; border-radius: 10px; padding: 11px 12px;
+  margin: 12px 3px 0; border-radius: 10px; padding: 11px 12px;
   color: #6c351f; background: #fff2e9; line-height: 1.55; font-size: 14px;
 }
+
+.drawing-stage { width: min(100%, 600px); margin: 0 auto; }
+.drawing-heading { display: flex; justify-content: space-between; gap: 16px; align-items: start; margin: 3px 3px 12px; }
+.drawing-eyebrow { color: #5d716c; font-size: 12px; font-weight: 760; letter-spacing: .08em; }
+.drawing-target { margin: 3px 0 0; font-size: clamp(21px, 4vw, 29px); letter-spacing: -.04em; }
+.drawing-subtitle { margin: 5px 0 0; color: #5d716c; font-size: 13px; line-height: 1.5; }
+.drawing-countdown { padding: 7px 9px; border-radius: 8px; color: #835032; background: #fff0dc; white-space: nowrap; font-size: 13px; }
+.drawing-canvas {
+  display: block; width: min(100%, 520px); aspect-ratio: 1; margin: 0 auto; border: 1px solid #c6ad8a;
+  border-radius: 12px; background: #f1c6a9; box-shadow: 0 10px 22px rgba(82, 60, 32, .14);
+  touch-action: none; image-rendering: pixelated;
+}
+.drawing-tools { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin: 13px 2px 0; }
+.brush-palette { display: flex; flex-wrap: wrap; gap: 8px; }
+.brush-color {
+  width: 30px; min-width: 30px; min-height: 30px; height: 30px; padding: 0; border: 3px solid #fff;
+  border-radius: 50%; background: var(--brush-color); box-shadow: 0 0 0 1px #b9c9bf;
+}
+.brush-color:not(:disabled):hover { background: var(--brush-color); }
+.brush-color--selected { box-shadow: 0 0 0 3px #173b36; transform: scale(1.06); }
+.drawing-skip { min-height: 37px; white-space: nowrap; }
+.drawing-hint { margin: 10px 3px 0; color: #60746d; font-size: 12px; line-height: 1.5; }
 
 .invite-panel { padding: 15px 17px; }
 .invite-panel h3 { margin: 0 0 5px; font-size: 14px; }
@@ -143,6 +180,8 @@ button.secondary:not(:disabled):hover { background: #d6e5dc; }
   .board-panel { order: 1; padding: 9px; }
   .lobby-grid { grid-template-columns: 1fr; gap: 18px; }
   .lobby-divider { border-left: 0; border-top: 1px solid #dce5df; padding-left: 0; padding-top: 18px; }
+  .drawing-heading { align-items: stretch; flex-direction: column; gap: 8px; }
+  .drawing-countdown { align-self: start; }
 }
 
 @media (max-width: 460px) {
@@ -152,4 +191,6 @@ button.secondary:not(:disabled):hover { background: #d6e5dc; }
   .sync-message { margin-left: 0; }
   .invite-row { flex-direction: column; }
   .disconnect-actions { grid-template-columns: 1fr; }
+  .drawing-tools { align-items: stretch; flex-direction: column; }
+  .drawing-skip { width: 100%; }
 }

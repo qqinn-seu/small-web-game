@@ -48,6 +48,8 @@ export interface PublicDrawing {
   roundId: string;
   winnerPlayerId: string;
   targetPlayerId: string;
+  winnerNickname?: string;
+  targetNickname?: string;
   deadlineAt: number;
   strokeUsed: boolean;
   draft: (StoredStroke & { lastSeq: number }) | null;

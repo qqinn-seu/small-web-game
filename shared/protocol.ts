@@ -34,6 +34,7 @@ export interface DrawingRequest extends RoundRequest { drawingId: string }
 export interface StrokeBeginRequest extends DrawingRequest { strokeId: string; colorIndex: number; startPoint: Point }
 export interface StrokePointsRequest extends DrawingRequest { strokeId: string; seq: number; points: Point[] }
 export interface StrokeEndRequest extends DrawingRequest { strokeId: string; lastSeq: number; pointCount: number }
+export interface WashProposeRequest extends RoomRequest { roundId: string | null }
 export interface ServerHello { protocolVersion: number; serverEpoch: string; serverTime: number }
 export interface ClientToServerEvents {
   'session:open': (request: SessionOpenRequest, ack: Ack<SessionData>) => void;
@@ -49,7 +50,7 @@ export interface ClientToServerEvents {
   'stroke:points': (request: StrokePointsRequest, ack: Ack) => void;
   'stroke:end': (request: StrokeEndRequest, ack: Ack) => void;
   'drawing:skip': (request: DrawingRequest, ack: Ack) => void;
-  'wash:propose': (request: RoundRequest, ack: Ack) => void;
+  'wash:propose': (request: WashProposeRequest, ack: Ack) => void;
   'wash:respond': (request: RoomRequest & { proposalId: string; accept: boolean }, ack: Ack) => void;
 }
 export interface ServerToClientEvents {

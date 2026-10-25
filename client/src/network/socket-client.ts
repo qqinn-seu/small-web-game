@@ -7,17 +7,23 @@ import type {
   ActionRequest,
   ClientToServerEvents,
   DisconnectResolveRequest,
+  DrawingRequest,
   JoinRequest,
   LeaveRequest,
   MoveRequest,
   ReadyRequest,
   ResumeRequest,
   RoomEntryData,
+  RoomRequest,
   ServerHello,
   ServerToClientEvents,
   SessionData,
   SessionOpenRequest,
+  StrokeBeginRequest,
+  StrokeEndRequest,
+  StrokePointsRequest,
   SyncRequest,
+  WashProposeRequest,
 } from '../../../shared/protocol.js';
 
 const ACK_TIMEOUT_MS = 3_500;
@@ -25,6 +31,7 @@ const ACK_RETRY_COUNT = 2;
 
 type TypedSocket = Socket<ServerToClientEvents, ClientToServerEvents>;
 type ClientEventName = keyof ClientToServerEvents;
+type RequestInput<T extends ActionRequest> = Omit<T, 'actionId'> & { actionId?: string };
 
 export interface ClientIdentity {
   playerId: string;
@@ -213,6 +220,33 @@ export class GomokuSocketClient {
 
   public async move(input: Omit<MoveRequest, 'actionId'>): Promise<AckResult> {
     return this.requestAuthenticated('game:move', { ...input, actionId: actionId() });
+  }
+
+  /** `actionId` may be retained by the drawing controller across a reconnect. */
+  public async strokeBegin(input: RequestInput<StrokeBeginRequest>): Promise<AckResult> {
+    return this.requestAuthenticated('stroke:begin', { ...input, actionId: input.actionId ?? actionId() });
+  }
+
+  /** `actionId` may be retained by the drawing controller across a reconnect. */
+  public async strokePoints(input: RequestInput<StrokePointsRequest>): Promise<AckResult> {
+    return this.requestAuthenticated('stroke:points', { ...input, actionId: input.actionId ?? actionId() });
+  }
+
+  /** `actionId` may be retained by the drawing controller across a reconnect. */
+  public async strokeEnd(input: RequestInput<StrokeEndRequest>): Promise<AckResult> {
+    return this.requestAuthenticated('stroke:end', { ...input, actionId: input.actionId ?? actionId() });
+  }
+
+  public async drawingSkip(input: RequestInput<DrawingRequest>): Promise<AckResult> {
+    return this.requestAuthenticated('drawing:skip', { ...input, actionId: input.actionId ?? actionId() });
+  }
+
+  public async washPropose(input: RequestInput<WashProposeRequest>): Promise<AckResult> {
+    return this.requestAuthenticated('wash:propose', { ...input, actionId: input.actionId ?? actionId() });
+  }
+
+  public async washRespond(input: RequestInput<RoomRequest & { proposalId: string; accept: boolean }>): Promise<AckResult> {
+    return this.requestAuthenticated('wash:respond', { ...input, actionId: input.actionId ?? actionId() });
   }
 
   public async sync(input: Omit<SyncRequest, 'actionId'>): Promise<AckResult> {

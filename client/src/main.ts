@@ -403,6 +403,51 @@ async function setReady(): Promise<void> {
   }
 }
 
+async function proposeWash(): Promise<void> {
+  const room = store.getState();
+  const identity = network.getIdentity();
+  const ownSeat = room?.seats.find((seat) => seat?.playerId === identity?.playerId) ?? null;
+  const bothOnline = Boolean(room?.seats.every((seat) => seat?.connected));
+  if (!room || !ownSeat || !bothOnline || (room.phase !== 'waiting' && room.phase !== 'finished') || !isOperational()) return;
+  try {
+    const response = await network.washPropose({
+      roomInstanceId: room.roomInstanceId,
+      baseVersion: room.version,
+      roundId: room.round?.roundId ?? null,
+    });
+    if (!response.ok) handleAckFailure(response);
+  } catch (error) {
+    ui.notify(networkErrorText(error));
+  }
+}
+
+async function respondWash(proposalId: string, accept: boolean): Promise<void> {
+  const room = store.getState();
+  const identity = network.getIdentity();
+  const ownSeat = room?.seats.find((seat) => seat?.playerId === identity?.playerId) ?? null;
+  const proposal = room?.washProposal;
+  if (
+    !room
+    || !ownSeat
+    || !proposal
+    || proposal.proposalId !== proposalId
+    || proposal.proposerPlayerId === identity?.playerId
+    || (room.phase !== 'waiting' && room.phase !== 'finished')
+    || !isOperational()
+  ) return;
+  try {
+    const response = await network.washRespond({
+      roomInstanceId: room.roomInstanceId,
+      baseVersion: room.version,
+      proposalId,
+      accept,
+    });
+    if (!response.ok) handleAckFailure(response);
+  } catch (error) {
+    ui.notify(networkErrorText(error));
+  }
+}
+
 async function placeMove(x: number, y: number): Promise<void> {
   const room = store.getState();
   const identity = network.getIdentity();
@@ -574,6 +619,13 @@ ui = new GameUI(root, {
   placeMove: (x, y) => void placeMove(x, y),
   leaveRoom: () => void leaveRoom(),
   resolveDisconnect: (targetPlayerId, decision) => void resolveDisconnect(targetPlayerId, decision),
+  strokeBegin: (request) => network.strokeBegin(request),
+  strokePoints: (request) => network.strokePoints(request),
+  strokeEnd: (request) => network.strokeEnd(request),
+  drawingSkip: (request) => network.drawingSkip(request),
+  requestDrawingSync: (reason) => void syncCurrentRoom(reason),
+  proposeWash: () => void proposeWash(),
+  respondWash: (proposalId, accept) => void respondWash(proposalId, accept),
 }, initialRoomCode);
 
 network = new GomokuSocketClient({

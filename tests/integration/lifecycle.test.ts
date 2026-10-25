@@ -154,7 +154,20 @@ async function finishFive(context: TwoPlayers, roundId: string): Promise<void> {
     [context.a, 8, 4, 0],
   ];
   for (const [socket, moveNo, x, y] of turns) expect((await move(socket, context.entry, roundId, moveNo, x, y)).ok).toBe(true);
-  await eventually(() => context.aObserver.state?.phase === 'finished', 'five-in-a-row did not finish');
+  await eventually(() => context.aObserver.state?.phase === 'drawing', 'five-in-a-row did not enter drawing');
+}
+
+async function skipDrawing(context: TwoPlayers, roundId: string, winner: 'a' | 'b' = 'a'): Promise<void> {
+  const observer = winner === 'a' ? context.aObserver : context.bObserver;
+  const socket = winner === 'a' ? context.a : context.b;
+  const drawing = observer.state?.drawing;
+  expect(drawing).not.toBeNull();
+  const response = await request(socket, 'drawing:skip', {
+    actionId: actionId('skip'), roomInstanceId: context.entry.roomInstanceId, baseVersion: 0,
+    roundId, drawingId: drawing!.drawingId,
+  });
+  expect(response.ok).toBe(true);
+  await eventually(() => observer.state?.phase === 'finished', 'drawing did not finish after skip');
 }
 
 beforeEach(async () => {
@@ -269,7 +282,7 @@ describe('M2 identity and room lifecycle', () => {
       roundId: round.roundId, targetPlayerId: context.bSession.playerId, decision: 'claim_win',
     });
     expect(claimed).toMatchObject({ ok: true });
-    await eventually(() => context.aObserver.state?.phase === 'finished' && context.aObserver.state.seats[1] === null, 'claim result missing');
+    await eventually(() => context.aObserver.state?.phase === 'drawing' && context.aObserver.state.seats[1] === null, 'claim drawing result missing');
     expect(context.aObserver.state?.round?.result).toMatchObject({
       winnerPlayerId: context.aSession.playerId, loserPlayerId: context.bSession.playerId, reason: 'disconnect',
     });
@@ -295,6 +308,11 @@ describe('M2 identity and room lifecycle', () => {
     await eventually(() => cObserver.state?.seats[1]?.playerId === cSession.playerId, 'replacement snapshot missing');
     const frozenResult = cObserver.state?.round?.result;
     expect(frozenResult?.loserPlayerId).toBe(context.bSession.playerId);
+    expect(cObserver.state?.drawing).toMatchObject({
+      winnerPlayerId: context.aSession.playerId, targetPlayerId: context.bSession.playerId,
+      targetNickname: 'Bob',
+    });
+    await skipDrawing(context, oldRound.roundId);
 
     expect((await request(context.a, 'round:ready', {
       actionId: actionId('ready-a'), roomInstanceId: context.entry.roomInstanceId, baseVersion: 0, roundId: oldRound.roundId, ready: true,
@@ -314,6 +332,7 @@ describe('M2 identity and room lifecycle', () => {
     const context = await setupTwoPlayers();
     const first = await startRound(context);
     await finishFive(context, first.roundId);
+    await skipDrawing(context, first.roundId);
     expect((await request(context.a, 'round:ready', {
       actionId: actionId('rematch-a'), roomInstanceId: context.entry.roomInstanceId, baseVersion: 0, roundId: first.roundId, ready: true,
     })).ok).toBe(true);
@@ -335,7 +354,7 @@ describe('M2 identity and room lifecycle', () => {
       actionId: actionId('resign'), roomInstanceId: context.entry.roomInstanceId, baseVersion: 0, roundId: oldRound.roundId,
     });
     expect(resigned).toMatchObject({ ok: true });
-    await eventually(() => context.bObserver.state?.phase === 'finished' && context.bObserver.state.seats[0] === null, 'resignation patch missing');
+    await eventually(() => context.bObserver.state?.phase === 'drawing' && context.bObserver.state.seats[0] === null, 'resignation drawing patch missing');
     await pause(30);
     expect(context.aObserver.patches).toHaveLength(patchesBeforeLeave);
     expect(context.bObserver.state?.round?.result).toMatchObject({
@@ -347,6 +366,7 @@ describe('M2 identity and room lifecycle', () => {
     const cSession = await open(c, 'Carol');
     expect((await request(c, 'room:join', { actionId: actionId('join-c'), roomCode: context.entry.roomCode })).ok).toBe(true);
     await eventually(() => cObserver.state?.seats[0]?.playerId === cSession.playerId, 'new seat snapshot missing');
+    await skipDrawing(context, oldRound.roundId, 'b');
     expect((await request(context.b, 'round:ready', {
       actionId: actionId('ready-b'), roomInstanceId: context.entry.roomInstanceId, baseVersion: 0, roundId: oldRound.roundId, ready: true,
     })).ok).toBe(true);
@@ -442,7 +462,8 @@ describe('M2 identity and room lifecycle', () => {
       const state = game.store.rooms.get(context.entry.roomCode)!.state;
       expect(Number(claim.ok) + Number(resumed.ok)).toBe(1);
       if (claim.ok) {
-        expect(state.phase).toBe('finished');
+        expect(state.phase).toBe('drawing');
+        expect(state.drawing?.winnerPlayerId).toBe(context.aSession.playerId);
         expect(state.seats[1]).toBeNull();
         expect(state.round?.result?.winnerPlayerId).toBe(context.aSession.playerId);
         expect(resumed).toMatchObject({ ok: false, errorCode: 'SEAT_RELEASED' });

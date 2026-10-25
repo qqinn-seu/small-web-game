@@ -1,6 +1,16 @@
-import type { RoomState } from '../../../shared/models.js';
-import type { RoomEntryData } from '../../../shared/protocol.js';
+import { BRUSH_COLORS, FACE_GRID_SIZE } from '../../../shared/constants.js';
+import type { FaceCanvas, RoomState, StoredStroke } from '../../../shared/models.js';
+import type {
+  AckResult,
+  DrawingRequest,
+  RoomEntryData,
+  StrokeBeginRequest,
+  StrokeEndRequest,
+  StrokePointsRequest,
+} from '../../../shared/protocol.js';
 import { BoardRenderer } from '../canvas/board-renderer.js';
+import { confirmedPixelCount, FaceRenderer } from '../canvas/face-renderer.js';
+import { DrawingController } from '../input/drawing-controller.js';
 import { bindBoardInput } from '../input/board-input.js';
 import type { ClientIdentity } from '../network/socket-client.js';
 
@@ -12,6 +22,13 @@ export interface AppActions {
   placeMove: (x: number, y: number) => void;
   leaveRoom: () => void;
   resolveDisconnect: (targetPlayerId: string, decision: 'claim_win' | 'keep_waiting') => void;
+  strokeBegin: (request: StrokeBeginRequest) => Promise<AckResult>;
+  strokePoints: (request: StrokePointsRequest) => Promise<AckResult>;
+  strokeEnd: (request: StrokeEndRequest) => Promise<AckResult>;
+  drawingSkip: (request: DrawingRequest) => Promise<AckResult>;
+  requestDrawingSync: (reason: string) => void;
+  proposeWash: () => void;
+  respondWash: (proposalId: string, accept: boolean) => void;
 }
 
 interface SeatNodes {
@@ -20,6 +37,8 @@ interface SeatNodes {
   name: HTMLElement;
   online: HTMLElement;
   ready: HTMLElement;
+  faceCanvas: HTMLCanvasElement;
+  faceRenderer: FaceRenderer;
 }
 
 function required<T extends Element>(root: ParentNode, selector: string): T {
@@ -62,9 +81,24 @@ export class GameUI {
   private readonly inviteInput: HTMLInputElement;
   private readonly copyInviteButton: HTMLButtonElement;
   private readonly boardCanvas: HTMLCanvasElement;
+  private readonly boardCaption: HTMLElement;
   private readonly seats: SeatNodes[];
   private readonly renderer: BoardRenderer;
   private readonly unbindBoardInput: () => void;
+  private readonly drawingStage: HTMLElement;
+  private readonly drawingTarget: HTMLElement;
+  private readonly drawingSubtitle: HTMLElement;
+  private readonly drawingCountdown: HTMLElement;
+  private readonly drawingCanvas: HTMLCanvasElement;
+  private readonly drawingRenderer: FaceRenderer;
+  private readonly drawingController: DrawingController;
+  private readonly brushButtons: HTMLButtonElement[];
+  private readonly drawingSkipButton: HTMLButtonElement;
+  private readonly washPanel: HTMLElement;
+  private readonly washButton: HTMLButtonElement;
+  private readonly washAcceptButton: HTMLButtonElement;
+  private readonly washRejectButton: HTMLButtonElement;
+  private readonly washStatus: HTMLElement;
   private readonly clockTimer: number;
 
   private room: RoomState | null = null;
@@ -81,6 +115,8 @@ export class GameUI {
   private messageText = '';
   private serverText = '服务器：正在连接';
   private clockOffsetMs = 0;
+  private selectedBrushColor = 0;
+  private localPreview: StoredStroke | null = null;
 
   public constructor(root: HTMLElement, private readonly actions: AppActions, initialRoomCode?: string) {
     root.innerHTML = `
@@ -90,7 +126,7 @@ export class GameUI {
             <div class="brand-mark" aria-hidden="true">●</div>
             <div><h1>同桌五子棋</h1><p>两个人，一盘认真下完的棋。</p></div>
           </div>
-          <span class="version" data-testid="room-version">M2 · v0.2.0</span>
+          <span class="version" data-testid="room-version">M3 v0.3.0</span>
         </header>
 
         <section class="connection-strip" aria-live="polite">
@@ -143,13 +179,11 @@ export class GameUI {
             <section class="seat-list" aria-label="玩家座位">
               <article class="seat-card" data-seat="A">
                 <div class="seat-top"><span class="seat-color">黑棋</span><span class="seat-online">空位</span></div>
-                <div class="seat-bottom"><strong class="seat-name" data-testid="player-name">等待玩家</strong></div>
-                <div class="seat-ready">未准备</div>
+                <div class="seat-person"><canvas class="face-canvas" data-testid="face-canvas" aria-label="A座玩家静态脸"></canvas><div class="seat-bottom"><strong class="seat-name" data-testid="player-name">等待玩家</strong><div class="seat-ready">未准备</div></div></div>
               </article>
               <article class="seat-card" data-seat="B">
                 <div class="seat-top"><span class="seat-color">白棋</span><span class="seat-online">空位</span></div>
-                <div class="seat-bottom"><strong class="seat-name" data-testid="player-name">等待玩家</strong></div>
-                <div class="seat-ready">未准备</div>
+                <div class="seat-person"><canvas class="face-canvas" data-testid="face-canvas" aria-label="B座玩家静态脸"></canvas><div class="seat-bottom"><strong class="seat-name" data-testid="player-name">等待玩家</strong><div class="seat-ready">未准备</div></div></div>
               </article>
             </section>
             <section class="turn-card">
@@ -165,6 +199,15 @@ export class GameUI {
               <button data-testid="claim-win-button" type="button" hidden>判定获胜</button>
               <button class="secondary" data-testid="keep-waiting-button" type="button" hidden>继续等待</button>
             </div>
+            <section class="wash-panel panel" hidden>
+              <div class="wash-heading"><strong>共同洗脸</strong><span>双方同意才会清除两张脸</span></div>
+              <p data-testid="wash-status" class="wash-status"></p>
+              <div class="wash-actions">
+                <button data-testid="wash-button" type="button">提议洗脸</button>
+                <button data-testid="wash-accept" type="button" hidden>接受洗脸</button>
+                <button data-testid="wash-reject" class="secondary" type="button" hidden>拒绝</button>
+              </div>
+            </section>
             <section class="invite-panel panel" hidden>
               <h3>邀请对方加入</h3>
               <p>可直接复制；若浏览器不允许自动复制，请手动复制下方链接。</p>
@@ -175,6 +218,12 @@ export class GameUI {
           <section class="board-panel panel">
             <canvas class="board-canvas" data-testid="board-canvas" aria-label="15乘15五子棋棋盘"></canvas>
             <div class="board-caption"><span data-testid="move-count">第 0 手 / 225</span><span class="pending-move" data-testid="pending-move" hidden>落子中</span></div>
+            <section class="drawing-stage" hidden aria-live="polite">
+              <div class="drawing-heading"><div><span class="drawing-eyebrow">结算画脸</span><h2 class="drawing-target">上一局输家</h2><p class="drawing-subtitle"></p></div><strong data-testid="drawing-countdown" class="drawing-countdown">剩余 0 秒</strong></div>
+              <canvas class="drawing-canvas" data-testid="drawing-canvas" aria-label="32乘32像素画脸画布"></canvas>
+              <div class="drawing-tools"><div class="brush-palette" aria-label="画笔颜色">${BRUSH_COLORS.map((color, index) => `<button type="button" class="brush-color" data-testid="brush-color-${index}" data-color-index="${index}" aria-label="画笔颜色 ${index + 1}" style="--brush-color:${color}"></button>`).join('')}</div><button data-testid="drawing-skip" class="secondary drawing-skip" type="button">跳过画脸</button></div>
+              <p class="drawing-hint">按下后保持一笔连续绘制，松开才会提交；对方会实时看到服务器确认的笔迹。</p>
+            </section>
             <p class="result-message" data-testid="result-message" hidden></p>
           </section>
         </section>
@@ -207,19 +256,56 @@ export class GameUI {
     this.invitePanel = required(root, '.invite-panel');
     this.inviteInput = required(root, '.invite-row input');
     this.copyInviteButton = required(root, '.invite-row button');
+    this.boardCanvas = required(root, '[data-testid="board-canvas"]');
+    this.boardCaption = required(root, '.board-caption');
+    this.drawingStage = required(root, '.drawing-stage');
+    this.drawingTarget = required(root, '.drawing-target');
+    this.drawingSubtitle = required(root, '.drawing-subtitle');
+    this.drawingCountdown = required(root, '[data-testid="drawing-countdown"]');
+    this.drawingCanvas = required(root, '[data-testid="drawing-canvas"]');
+    this.drawingSkipButton = required(root, '[data-testid="drawing-skip"]');
+    this.brushButtons = BRUSH_COLORS.map((_, index) => required<HTMLButtonElement>(root, `[data-testid="brush-color-${index}"]`));
+    this.washPanel = required(root, '.wash-panel');
+    this.washButton = required(root, '[data-testid="wash-button"]');
+    this.washAcceptButton = required(root, '[data-testid="wash-accept"]');
+    this.washRejectButton = required(root, '[data-testid="wash-reject"]');
+    this.washStatus = required(root, '[data-testid="wash-status"]');
     this.seats = ['A', 'B'].map((seatId) => {
       const card = required<HTMLElement>(root, `[data-seat="${seatId}"]`);
+      const faceCanvas = required<HTMLCanvasElement>(card, '[data-testid="face-canvas"]');
       return {
         card,
         color: required(card, '.seat-color'),
         name: required(card, '.seat-name'),
         online: required(card, '.seat-online'),
         ready: required(card, '.seat-ready'),
+        faceCanvas,
+        faceRenderer: new FaceRenderer(faceCanvas),
       };
     });
 
-    this.boardCanvas = required<HTMLCanvasElement>(root, '[data-testid="board-canvas"]');
     this.renderer = new BoardRenderer(this.boardCanvas);
+    this.drawingRenderer = new FaceRenderer(this.drawingCanvas);
+    this.drawingController = new DrawingController({
+      canvas: this.drawingCanvas,
+      getRoom: () => this.room,
+      getIdentity: () => this.identity,
+      isOperational: () => this.isDrawingOperational(),
+      getColorIndex: () => this.selectedBrushColor,
+      sender: {
+        strokeBegin: (request) => this.actions.strokeBegin(request),
+        strokePoints: (request) => this.actions.strokePoints(request),
+        strokeEnd: (request) => this.actions.strokeEnd(request),
+        drawingSkip: (request) => this.actions.drawingSkip(request),
+      },
+      requestSync: (reason) => this.actions.requestDrawingSync(reason),
+      notify: (message) => this.notify(message),
+      onLocalPreview: (preview) => {
+        this.localPreview = preview;
+        this.renderFaces();
+        this.renderDrawing();
+      },
+    });
     this.unbindBoardInput = bindBoardInput(this.boardCanvas, {
       canPlace: () => this.canPlace(),
       onPlaceIntent: (x, y) => this.actions.placeMove(x, y),
@@ -239,6 +325,14 @@ export class GameUI {
     this.claimWinButton.addEventListener('click', () => this.resolveOpponent('claim_win'));
     this.keepWaitingButton.addEventListener('click', () => this.resolveOpponent('keep_waiting'));
     this.copyInviteButton.addEventListener('click', () => void this.copyInvitation());
+    this.brushButtons.forEach((button, index) => button.addEventListener('click', () => {
+      this.selectedBrushColor = index;
+      this.renderDrawing();
+    }));
+    this.drawingSkipButton.addEventListener('click', () => this.drawingController.skip());
+    this.washButton.addEventListener('click', () => this.actions.proposeWash());
+    this.washAcceptButton.addEventListener('click', () => this.respondWash(true));
+    this.washRejectButton.addEventListener('click', () => this.respondWash(false));
 
     if (initialRoomCode) {
       this.roomCodeInput.value = initialRoomCode;
@@ -253,6 +347,7 @@ export class GameUI {
     this.networkReady = ready;
     if (identity) this.nicknameInput.value = identity.nickname;
     this.render();
+    this.drawingController.setOperational();
   }
 
   /** Display a saved nickname while its private credential is being verified. */
@@ -269,6 +364,7 @@ export class GameUI {
   public setNetworkReady(ready: boolean): void {
     this.networkReady = ready;
     this.render();
+    this.drawingController.setOperational();
   }
 
   public setClockOffset(serverTime: number): void {
@@ -281,6 +377,7 @@ export class GameUI {
     this.room = room;
     if (room?.phase === 'playing') this.messageText = '';
     this.renderer.setRoom(room);
+    this.drawingController.setRoom(room);
     this.render();
     if (enteringPlaying) {
       window.requestAnimationFrame(() => {
@@ -312,11 +409,13 @@ export class GameUI {
   public setSynchronizing(synchronizing: boolean): void {
     this.synchronizing = synchronizing;
     this.render();
+    this.drawingController.setOperational();
   }
 
   public setRestoringRoom(restoring: boolean): void {
     this.restoringRoom = restoring;
     this.render();
+    this.drawingController.setOperational();
   }
 
   public setInvitation(entry: RoomEntryData | null): void {
@@ -348,21 +447,22 @@ export class GameUI {
     window.clearInterval(this.clockTimer);
     this.unbindBoardInput();
     this.renderer.destroy();
+    this.drawingController.destroy();
+    this.drawingRenderer.destroy();
+    this.seats.forEach((seat) => seat.faceRenderer.destroy());
   }
 
   private render(): void {
     const ownSeat = this.room?.seats.find((seat) => seat?.playerId === this.identity?.playerId) ?? null;
     const roomCode = this.room?.roomCode ?? '';
     const invite = this.invitation ?? (roomCode ? invitationFrom(roomCode) : '');
+    const drawingActive = this.room?.phase === 'drawing';
 
     this.identityPanel.hidden = Boolean(this.identity);
     this.lobby.hidden = Boolean(this.room) || this.restoringRoom;
     this.gamePanel.hidden = !this.room;
     this.fullRoomNote.hidden = !this.roomFull || Boolean(this.room);
     this.joinPanel.hidden = this.roomFull && !this.room;
-    // A first create/join click is also the approved identity-establishment
-    // action. Once an identity exists, normal M2 network/snapshot gating
-    // applies and no room-changing intent can pass during recovery.
     const admissionBlocked = Boolean(this.identity) && !this.networkReady;
     this.createButton.disabled = this.roomEntryBusy || Boolean(this.room) || admissionBlocked;
     this.joinButton.disabled = this.roomEntryBusy || Boolean(this.room) || admissionBlocked;
@@ -372,18 +472,24 @@ export class GameUI {
 
     this.roomCode.textContent = roomCode || '—';
     this.playerName.textContent = this.identity?.nickname ?? '未建立身份';
-    this.version.textContent = this.room ? `M2 · v0.2.0 · 状态 v${this.room.version}` : 'M2 · v0.2.0';
+    this.version.textContent = this.room ? `M3 v0.3.0 · 状态 v${this.room.version}` : 'M3 v0.3.0';
     this.serverStatus.textContent = this.serverText;
-    this.statusMessage.textContent = this.messageText || (this.room?.phase === 'playing' ? this.turnText() : this.connectionText);
+    this.statusMessage.textContent = this.messageText || ((this.room?.phase === 'playing' || drawingActive) ? this.turnText() : this.connectionText);
     this.syncMessage.hidden = !this.synchronizing || this.restoringRoom;
     this.pendingMove.hidden = !this.movePending;
     this.moveCount.textContent = `第 ${this.room?.round?.moveNo ?? 0} 手 / 225`;
+    this.boardCanvas.hidden = Boolean(drawingActive);
+    this.boardCaption.hidden = Boolean(drawingActive);
+    this.drawingStage.hidden = !drawingActive;
 
     this.renderSeats();
+    this.renderFaces();
     this.currentTurn.textContent = this.turnText();
     this.renderReady(ownSeat);
     this.renderLeave(ownSeat);
     this.renderDisconnectDecision(ownSeat);
+    this.renderDrawing();
+    this.renderWash(ownSeat);
     this.invitePanel.hidden = !this.room;
     this.inviteInput.value = invite;
     this.renderResult();
@@ -413,8 +519,106 @@ export class GameUI {
     });
   }
 
+  private renderFaces(): void {
+    const drawing = this.room?.phase === 'drawing' ? this.room.drawing : null;
+    this.seats.forEach((seatNodes, index) => {
+      const seat = this.room?.seats[index] ?? null;
+      const ownerPlayerId = seat?.playerId ?? '';
+      const face = ownerPlayerId ? this.faceFor(ownerPlayerId) : null;
+      const isTarget = Boolean(drawing && ownerPlayerId === drawing.targetPlayerId);
+      seatNodes.faceRenderer.setState({
+        face,
+        draft: isTarget ? drawing?.draft : null,
+        localPreview: isTarget ? this.localPreview : null,
+      });
+      // The target can have left its seat during drawing; static seat cards still
+      // retain their own owner metadata rather than being re-bound to a newcomer.
+      seatNodes.faceCanvas.dataset.playerId = ownerPlayerId;
+      seatNodes.faceCanvas.dataset.ownerPlayerId = ownerPlayerId;
+      seatNodes.faceCanvas.dataset.revision = String(face?.revision ?? 0);
+      seatNodes.faceCanvas.dataset.confirmedPixelCount = String(confirmedPixelCount(face));
+    });
+
+    const targetPlayerId = drawing?.targetPlayerId ?? '';
+    const targetFace = targetPlayerId ? this.faceFor(targetPlayerId) : null;
+    this.drawingRenderer.setState({
+      face: targetFace,
+      draft: drawing?.draft ?? null,
+      localPreview: this.localPreview,
+    });
+    this.drawingCanvas.dataset.playerId = targetPlayerId;
+    this.drawingCanvas.dataset.ownerPlayerId = targetPlayerId;
+    this.drawingCanvas.dataset.revision = String(targetFace?.revision ?? 0);
+    this.drawingCanvas.dataset.confirmedPixelCount = String(confirmedPixelCount(targetFace));
+  }
+
+  private renderDrawing(): void {
+    const drawing = this.room?.phase === 'drawing' ? this.room.drawing : null;
+    const targetFace = drawing ? this.faceFor(drawing.targetPlayerId) : null;
+    const isWinner = Boolean(drawing && drawing.winnerPlayerId === this.identity?.playerId);
+    const canDraw = this.drawingController.canStart();
+    const canSkip = this.drawingController.canSkip();
+    const targetName = drawing?.targetNickname ?? this.nicknameFor(drawing?.targetPlayerId) ?? '上一局输家';
+
+    this.drawingTarget.textContent = targetName;
+    this.drawingSubtitle.textContent = isWinner
+      ? `你获胜了，选择颜色后在 ${targetName} 的脸上画一笔。`
+      : drawing
+        ? `${drawing.winnerNickname ?? this.nicknameFor(drawing.winnerPlayerId) ?? '获胜者'} 正在结算这一局。`
+        : '';
+    this.drawingCountdown.textContent = drawing ? `剩余 ${this.secondsRemaining(drawing.deadlineAt)} 秒` : '剩余 0 秒';
+    this.drawingCanvas.dataset.ownerPlayerId = drawing?.targetPlayerId ?? '';
+    this.drawingCanvas.dataset.drawingId = drawing?.drawingId ?? '';
+    this.drawingCanvas.dataset.phase = this.room?.phase ?? '';
+    this.drawingCanvas.dataset.draftPointCount = String(drawing?.draft?.points.length ?? 0);
+    this.drawingCanvas.dataset.confirmedPixelCount = String(confirmedPixelCount(targetFace));
+    this.drawingCanvas.dataset.gridSize = String(FACE_GRID_SIZE);
+    this.drawingCanvas.dataset.canDraw = String(canDraw);
+
+    this.brushButtons.forEach((button, index) => {
+      button.hidden = !isWinner;
+      button.disabled = !canDraw;
+      button.classList.toggle('brush-color--selected', index === this.selectedBrushColor);
+      button.setAttribute('aria-pressed', String(index === this.selectedBrushColor));
+    });
+    this.drawingSkipButton.hidden = !isWinner;
+    this.drawingSkipButton.disabled = !canSkip;
+  }
+
+  private renderWash(ownSeat: RoomState['seats'][number] | null): void {
+    const phaseAllowsWash = this.room?.phase === 'waiting' || this.room?.phase === 'finished';
+    const everyoneOnline = Boolean(this.room?.seats.every((seat) => seat?.connected));
+    const proposal = phaseAllowsWash ? this.room?.washProposal ?? null : null;
+    const canUseWash = Boolean(ownSeat && phaseAllowsWash && everyoneOnline && this.networkReady && !this.synchronizing && !this.restoringRoom);
+    this.washPanel.hidden = !canUseWash && !proposal;
+    this.washButton.hidden = Boolean(proposal);
+    this.washButton.disabled = !canUseWash;
+    this.washAcceptButton.hidden = true;
+    this.washRejectButton.hidden = true;
+
+    if (!proposal) {
+      this.washStatus.textContent = canUseWash ? '两人在线，可提议清空双方累计笔迹。' : '';
+      return;
+    }
+    const isProposer = proposal.proposerPlayerId === this.identity?.playerId;
+    const canRespond = canUseWash && !isProposer && proposal.participantIds.includes(this.identity?.playerId ?? '');
+    this.washAcceptButton.hidden = !canRespond;
+    this.washRejectButton.hidden = !canRespond;
+    this.washAcceptButton.disabled = !canRespond;
+    this.washRejectButton.disabled = !canRespond;
+    this.washStatus.textContent = isProposer
+      ? `已提议洗脸，等待对方确认（${this.secondsRemaining(proposal.deadlineAt)} 秒）。`
+      : `对方提议清空双方笔迹（${this.secondsRemaining(proposal.deadlineAt)} 秒）。`;
+  }
+
   private turnText(): string {
     if (!this.room) return this.restoringRoom ? '正在恢复原房间座位' : '等待房间状态';
+    const drawing = this.room.phase === 'drawing' ? this.room.drawing : null;
+    if (drawing) {
+      if (drawing.winnerPlayerId === this.identity?.playerId) return `你赢了，请给 ${drawing.targetNickname ?? '对方'} 画脸`;
+      if (drawing.targetPlayerId === this.identity?.playerId) return '本局失利，对方正在给你的脸作画';
+      return '前一局正在结算，等待前任玩家完成画脸';
+    }
     const round = this.room.round;
     if (!round) return '等待两位玩家准备开始';
     const ownIsParticipant = Boolean(this.identity && round.participantIds.includes(this.identity.playerId));
@@ -475,9 +679,7 @@ export class GameUI {
     this.reconnectCountdown.hidden = !waitingForOpponent;
     if (waitingForOpponent) {
       const deadline = opponent?.reconnectDeadline;
-      const seconds = typeof deadline === 'number'
-        ? Math.max(0, Math.ceil((deadline - (Date.now() + this.clockOffsetMs)) / 1_000))
-        : null;
+      const seconds = typeof deadline === 'number' ? this.secondsRemaining(deadline) : null;
       this.reconnectCountdown.textContent = seconds === null
         ? '对方掉线，等待重连。'
         : seconds > 0
@@ -501,23 +703,26 @@ export class GameUI {
 
   private renderResult(): void {
     const result = this.room?.round?.result;
-    if (!result || this.room?.phase !== 'finished') {
+    const phase = this.room?.phase;
+    if (!result || (phase !== 'drawing' && phase !== 'finished')) {
       this.resultMessage.hidden = true;
       this.resultMessage.textContent = '';
       return;
     }
-    const isParticipant = Boolean(this.identity && this.room.round?.participantIds.includes(this.identity.playerId));
+    const isParticipant = Boolean(this.identity && this.room?.round?.participantIds.includes(this.identity.playerId));
     let outcome: string;
     if (!isParticipant) {
-      outcome = '上一局已结束；你是新加入的玩家，等待新局。';
+      outcome = phase === 'drawing'
+        ? '上一局已有胜负，正在等待前任玩家完成结算；你不是本局输家。'
+        : '上一局已结束；你是新加入的玩家，等待新局。';
     } else if (!result.winnerPlayerId || result.reason === 'draw') {
       outcome = '平：本局平局。';
     } else if (result.winnerPlayerId === this.identity?.playerId) {
-      outcome = '胜：你赢了本局。';
+      outcome = phase === 'drawing' ? '胜：你赢了本局，现在可以画对方的脸。' : '胜：你赢了本局。';
     } else {
-      outcome = '负：本局失利。';
+      outcome = phase === 'drawing' ? '负：你失利了，对方正在给你的脸作画。' : '负：本局失利。';
     }
-    this.resultMessage.textContent = `${outcome} 画脸表现将在后续里程碑开放；再战现已可用。`;
+    this.resultMessage.textContent = outcome;
     this.resultMessage.hidden = false;
   }
 
@@ -536,10 +741,32 @@ export class GameUI {
     );
   }
 
+  private isDrawingOperational(): boolean {
+    return this.networkReady && !this.synchronizing && !this.restoringRoom;
+  }
+
   private resolveOpponent(decision: 'claim_win' | 'keep_waiting'): void {
     const round = this.room?.round;
     const playerId = round?.participantIds.find((candidate) => candidate !== this.identity?.playerId);
     if (playerId) this.actions.resolveDisconnect(playerId, decision);
+  }
+
+  private respondWash(accept: boolean): void {
+    const proposal = this.room?.washProposal;
+    if (proposal) this.actions.respondWash(proposal.proposalId, accept);
+  }
+
+  private faceFor(playerId: string): FaceCanvas | null {
+    return this.room?.faces[playerId] ?? null;
+  }
+
+  private nicknameFor(playerId: string | undefined): string | undefined {
+    if (!playerId) return undefined;
+    return this.room?.seats.find((seat) => seat?.playerId === playerId)?.nickname;
+  }
+
+  private secondsRemaining(deadlineAt: number): number {
+    return Math.max(0, Math.ceil((deadlineAt - (Date.now() + this.clockOffsetMs)) / 1_000));
   }
 
   private async copyInvitation(): Promise<void> {
