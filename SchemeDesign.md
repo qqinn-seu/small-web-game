@@ -276,6 +276,12 @@ README限制：纯内存，重启/休眠丢房间；免费唤醒慢；不支持�
 4. 画脸20秒不暂停；未完整确认不存档，刷新不得第二笔。
 5. 洗脸清空当前两人全部笔迹；仅waiting/finished，另一人30秒确认。
 
+### M2 实现细化
+
+`session:open`的私有响应额外返回本人占座的房间入口`room`（房间码、实例、邀请路径或null），便于在首次加入确认丢失、localStorage房间记录不完整时恢复本人座位；不对第三人公开任何房间状态。`room:resume`确认返回同样的入口数据，可选携带`syncRequestId`关联快照。`room:leave`额外携带当前`roundId`（无对局为null），服务端拒绝旧局离开意图，避免迟到请求导致下一局认输。恢复后取得完整快照才开放落子。
+
+M2尚未实现画脸，因此五连、主动认输和超时裁决暂时直接进入finished；M3再接入已确定的drawing环节。60秒裁决只适用于playing阶段；waiting/finished不追溯改写结果，也不自动释放保留座位，玩家可恢复或在线方主动离开另建房间。任意阶段双方连续离线10分钟销毁房间。
+
 ## References
 
 [1]: https://socket.io/docs/v4/delivery-guarantees "Socket.IO Delivery guarantees"

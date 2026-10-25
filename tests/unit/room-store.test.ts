@@ -85,4 +85,29 @@ describe('client authoritative room mirror', () => {
     expect(result.state?.round?.board).not.toBe(message.state.round.board);
     expect(message.state.round.moveNo).toBe(0);
   });
+  it('rebuilds a same-version full snapshot on reconnect without trusting ACKs or early patches', () => {
+    const store = joinedStore(3);
+    store.beginRoomRecovery({ roomCode: 'ABC234', roomInstanceId: 'test-instance-0001', invitationPath: '/r/ABC234' });
+    expect(store.isRecovering()).toBe(true);
+    const authoritative = snapshot(3);
+    authoritative.state.updatedAt = 999;
+    expect(store.receiveSnapshot(authoritative)).toBe(true);
+    expect(store.getState()?.updatedAt).toBe(999);
+    expect(store.isRecovering()).toBe(false);
+  });
+  it('does not release recovery for an older or foreign snapshot', () => {
+    const store = joinedStore(3);
+    store.beginRoomRecovery({ roomCode: 'ABC234', roomInstanceId: 'test-instance-0001', invitationPath: '/r/ABC234' });
+    expect(store.receiveSnapshot(snapshot(2))).toBe(false);
+    expect(store.receiveSnapshot({ ...snapshot(4), roomInstanceId: 'foreign-instance' })).toBe(false);
+    expect(store.isRecovering()).toBe(true);
+    expect(store.getState()?.version).toBe(3);
+  });
+  it('stays frozen when sync fails and rebuilds from an equal-version authoritative snapshot', () => {
+    const store = joinedStore(3);
+    store.markSyncFailed();
+    expect(store.isSynchronizing()).toBe(true);
+    expect(store.receiveSnapshot(snapshot(3))).toBe(true);
+    expect(store.isSynchronizing()).toBe(false);
+  });
 });

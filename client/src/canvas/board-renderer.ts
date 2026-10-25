@@ -133,6 +133,8 @@ export class BoardRenderer {
 
     this.drawGrid();
     const round = this.room?.round ?? null;
+    this.canvas.dataset.phase = this.room?.phase ?? '';
+    this.canvas.dataset.roundId = round?.roundId ?? '';
     this.canvas.dataset.moveNo = String(round?.moveNo ?? 0);
     const visual = getBoardVisualState(round);
     if (visual.winningLine.length >= 2) this.drawWinningLine(visual.winningLine);

@@ -19,6 +19,7 @@ export class RoomStore {
   private bufferedPatches = new Map<number, PatchMessage>();
   private entryInProgress = false;
   private expectedInstanceId: string | null = null;
+  private recovering = false;
   private syncing = false;
   private syncHandler: ((info: SyncRequestInfo) => void) | null = null;
 
@@ -36,6 +37,11 @@ export class RoomStore {
     return this.syncing;
   }
 
+  /** UI actions remain closed until this recovery receives a full snapshot. */
+  public isRecovering(): boolean {
+    return this.recovering;
+  }
+
   public onSyncNeeded(handler: (info: SyncRequestInfo) => void): void {
     this.syncHandler = handler;
   }
@@ -44,7 +50,23 @@ export class RoomStore {
   public beginRoomEntry(): void {
     this.entryInProgress = true;
     this.expectedInstanceId = null;
+    this.recovering = false;
     this.state = null;
+    this.bufferedPatches.clear();
+    this.syncing = false;
+    this.publish();
+  }
+
+  /**
+   * Prepare to replace a stale in-memory mirror with the exact room's complete
+   * resume snapshot. Existing board data is display-only while recovering and
+   * is never persisted.
+   */
+  public beginRoomRecovery(entry: RoomEntryData): void {
+    this.entryInProgress = true;
+    this.expectedInstanceId = entry.roomInstanceId;
+    this.recovering = true;
+    if (this.state && this.state.roomInstanceId !== entry.roomInstanceId) this.state = null;
     this.bufferedPatches.clear();
     this.syncing = false;
     this.publish();
@@ -59,31 +81,48 @@ export class RoomStore {
       this.bufferedPatches.clear();
       this.publish();
     }
+    // The server snapshot may win the Socket.IO ordering race and arrive
+    // before this ACK. The snapshot is already the authoritative admission;
+    // do not reopen a fictitious entry-in-progress state afterwards.
+    if (this.state?.roomInstanceId === entry.roomInstanceId) {
+      this.entryInProgress = false;
+      this.expectedInstanceId = null;
+    }
   }
 
   /** Reject unsolicited or failed-entry room traffic (notably ROOM_FULL). */
   public cancelRoomEntry(): void {
+    this.clearRoom();
+  }
+
+  /** Clear only the local authoritative mirror; persistent policy lives above. */
+  public clearRoom(): void {
     this.entryInProgress = false;
     this.expectedInstanceId = null;
+    this.recovering = false;
     this.state = null;
     this.bufferedPatches.clear();
     this.syncing = false;
     this.publish();
   }
 
-  public receiveSnapshot(message: SnapshotMessage): void {
-    if (!this.mayAcceptSnapshot(message)) return;
+  /** @returns true when the complete snapshot was adopted. */
+  public receiveSnapshot(message: SnapshotMessage): boolean {
+    if (!this.mayAcceptSnapshot(message)) return false;
 
-    const result = reduceSnapshot(this.state, message);
-    if (result.status !== 'applied') return;
+    const result = reduceSnapshot(this.state, message, { replaceAtSameVersion: this.recovering || this.syncing });
+    if (result.status !== 'applied' || !result.state) return false;
 
     this.state = result.state;
     this.entryInProgress = false;
+    this.expectedInstanceId = null;
+    this.recovering = false;
     this.syncing = false;
     this.dropObsoleteBufferedPatches();
     this.drainBufferedPatches();
     if (this.bufferedPatches.size > 0) this.requestSync();
     this.publish();
+    return true;
   }
 
   public receivePatch(message: PatchMessage): void {
@@ -92,7 +131,7 @@ export class RoomStore {
 
     // Once a hole exists, avoid showing a guessed intermediate state. Buffer
     // short concurrent bursts until the authoritative sync snapshot arrives.
-    if (this.syncing || message.prevVersion !== this.state.version) {
+    if (this.recovering || this.syncing || message.prevVersion !== this.state.version) {
       this.bufferPatch(message);
       this.requestSync();
       return;
@@ -111,7 +150,7 @@ export class RoomStore {
   public markSyncFailed(): void {
     // Keep the mirror frozen rather than applying buffered patches without the
     // missing state. A future server snapshot can still recover it.
-    this.syncing = false;
+    this.syncing = true;
     this.publish();
   }
 

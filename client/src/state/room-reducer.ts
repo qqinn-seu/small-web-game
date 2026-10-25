@@ -15,6 +15,11 @@ export interface RoomReducerResult {
   status: RoomReducerStatus;
 }
 
+export interface SnapshotReduceOptions {
+  /** A reconnect's complete snapshot is allowed to rebuild an equal version. */
+  replaceAtSameVersion?: boolean;
+}
+
 function cloneSnapshotState(message: SnapshotMessage): RoomState {
   const state = message.state;
   return {
@@ -49,11 +54,18 @@ function cloneSnapshotState(message: SnapshotMessage): RoomState {
 }
 
 /** Replace the complete public state from a server snapshot. */
-export function reduceSnapshot(current: RoomState | null, message: SnapshotMessage): RoomReducerResult {
+export function reduceSnapshot(
+  current: RoomState | null,
+  message: SnapshotMessage,
+  options: SnapshotReduceOptions = {},
+): RoomReducerResult {
   if (current && current.roomInstanceId !== message.roomInstanceId) {
     return { state: current, status: 'foreign' };
   }
-  if (current && message.version <= current.version) {
+  if (current && message.version < current.version) {
+    return { state: current, status: 'stale' };
+  }
+  if (current && message.version === current.version && !options.replaceAtSameVersion) {
     return { state: current, status: 'stale' };
   }
   return { state: cloneSnapshotState(message), status: 'applied' };

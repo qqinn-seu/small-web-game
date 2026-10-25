@@ -5,12 +5,18 @@ import express, { type Express } from 'express';
 import { Server, type Socket } from 'socket.io';
 import { z } from 'zod';
 
-import { BOARD_CELLS, BOARD_SIZE, NICKNAME_MAX_LENGTH, PROTOCOL_VERSION } from '../../shared/constants.js';
+import {
+  BOARD_CELLS,
+  BOARD_SIZE,
+  NICKNAME_MAX_LENGTH,
+  PROTOCOL_VERSION,
+  RECONNECT_GRACE_MS,
+  ROOM_IDLE_TTL_MS,
+} from '../../shared/constants.js';
 import type {
   Cell,
   PatchMessage,
   PublicRound,
-  PublicSeat,
   RoomChanges,
   RoomState,
   SeatId,
@@ -19,10 +25,13 @@ import type {
 import type {
   AckResult,
   ClientToServerEvents,
+  DisconnectResolveRequest,
   ErrorCode,
   JoinRequest,
+  LeaveRequest,
   MoveRequest,
   ReadyRequest,
+  ResumeRequest,
   RoomEntryData,
   ServerToClientEvents,
   SessionData,
@@ -31,11 +40,20 @@ import type {
   SyncRequest,
 } from '../../shared/protocol.js';
 import { isBoardFull, boardIndex, winningLineForMove } from './domain/rules.js';
+import {
+  clearReady,
+  createRound,
+  publicSeat,
+  roomEntry,
+  seatForPlayer,
+  seatIndexForPlayer,
+  seatsAreOnline,
+  updateNoConnectedPlayersSince,
+} from './lifecycle/room-lifecycle.js';
+import { GameStore, type GameStoreView, type PlayerRecord, type RoomRecord } from './lifecycle/store.js';
+import { MemberOperations } from './lifecycle/member-operations.js';
 
 const ROOM_CODE_LENGTH = 6;
-const PLAYER_ID_BYTES = 18;
-const SECRET_BYTES = 32;
-const ROOM_INSTANCE_BYTES = 18;
 const ROUND_ID_BYTES = 18;
 const SERVER_EPOCH_BYTES = 12;
 const MAX_ROOMS = 500;
@@ -44,7 +62,6 @@ const MAX_ACTIONS_PER_PLAYER = 200;
 const ACTION_CACHE_TTL_MS = 10 * 60_000;
 const RATE_WINDOW_MS = 10_000;
 // A player can legally place up to 113 stones in one complete 15×15 game.
-// Keep this comfortably above that legitimate burst while still bounding abuse.
 const RATE_MAX_REQUESTS = 240;
 
 export const M1_SERVICE_LIMITS = Object.freeze({
@@ -62,45 +79,21 @@ type GameSocket = Socket<
   Record<string, never>,
   SocketData
 >;
-
 type AckCallback = (response: AckResult<unknown>) => void;
 
-interface PlayerRecord {
-  playerId: string;
-  nickname: string;
-  secretSalt: string;
-  secretHash: string;
-  activeSocketId: string | null;
-  controlEpoch: number;
-  roomInstanceId: string | null;
-  createdAt: number;
-  lastSeenAt: number;
-  actionCache: Map<string, ActionCacheEntry>;
-}
-
-interface ActionCacheEntry {
-  payloadHash: string;
-  response: AckResult<unknown>;
-  createdAt: number;
-}
-
-interface RoomRecord {
-  state: RoomState;
-  pendingJoinPlayerIds: Set<string>;
-}
-
-interface RateBucket {
-  timestamps: number[];
+interface RateBucket { timestamps: number[] }
+interface InFlightAction {
+  fingerprint: string;
+  response: Promise<AckResult<unknown>>;
 }
 
 export interface CreateGameServerOptions {
   /** Tests normally disable static files. Production index.ts enables them. */
   serveStatic?: boolean;
-}
-
-export interface GameStoreView {
-  readonly rooms: ReadonlyMap<string, RoomRecord>;
-  readonly players: ReadonlyMap<string, PlayerRecord>;
+  /** Internal deterministic clock injection for server and integration tests. */
+  now?: () => number;
+  /** Defaults to one second in production; zero disables only the periodic scan. */
+  maintenanceIntervalMs?: number;
 }
 
 export interface GameServer {
@@ -108,6 +101,8 @@ export interface GameServer {
   httpServer: HttpServer;
   io: Server<ClientToServerEvents, ServerToClientEvents, Record<string, never>, SocketData>;
   store: GameStoreView;
+  /** Runs idle-room expiry against the internal clock; useful with an injected test clock. */
+  runMaintenance: () => void;
   close: () => Promise<void>;
 }
 
@@ -143,15 +138,19 @@ const sessionOpenSchema = z.object({
 });
 
 const createSchema = z.object({ actionId: actionIdSchema }).strict();
-const joinSchema = z.object({
-  actionId: actionIdSchema,
-  roomCode: roomCodeSchema,
-}).strict();
+const joinSchema = z.object({ actionId: actionIdSchema, roomCode: roomCodeSchema }).strict();
 const syncSchema = z.object({
   actionId: actionIdSchema,
   roomInstanceId: opaqueIdSchema,
   lastVersion: versionSchema,
   syncRequestId: opaqueIdSchema,
+}).strict();
+const resumeSchema = z.object({
+  actionId: actionIdSchema,
+  roomCode: roomCodeSchema,
+  roomInstanceId: opaqueIdSchema,
+  lastVersion: versionSchema,
+  syncRequestId: opaqueIdSchema.optional(),
 }).strict();
 const readySchema = z.object({
   actionId: actionIdSchema,
@@ -159,6 +158,12 @@ const readySchema = z.object({
   baseVersion: versionSchema,
   roundId: z.string().min(12).max(128).nullable(),
   ready: z.boolean(),
+}).strict();
+const leaveSchema = z.object({
+  actionId: actionIdSchema,
+  roomInstanceId: opaqueIdSchema,
+  baseVersion: versionSchema,
+  roundId: z.string().min(12).max(128).nullable(),
 }).strict();
 const moveSchema = z.object({
   actionId: actionIdSchema,
@@ -169,25 +174,28 @@ const moveSchema = z.object({
   y: z.number().int().min(0).max(BOARD_SIZE - 1),
   expectedMoveNo: z.number().int().min(0).max(BOARD_CELLS),
 }).strict();
+const disconnectResolveSchema = z.object({
+  actionId: actionIdSchema,
+  roomInstanceId: opaqueIdSchema,
+  baseVersion: versionSchema,
+  roundId: opaqueIdSchema,
+  targetPlayerId: opaqueIdSchema,
+  decision: z.enum(['claim_win', 'keep_waiting']),
+}).strict();
 
 function randomId(bytes: number): string {
   return randomBytes(bytes).toString('base64url');
 }
 
 function makeRoomCode(): string {
-  // Ambiguous characters are deliberately omitted for verbal room-code entry.
   const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   const bytes = randomBytes(ROOM_CODE_LENGTH);
   return [...bytes].map((value) => alphabet[value % alphabet.length]).join('');
 }
 
 function canonicalJson(value: unknown): string {
-  if (value === null || typeof value !== 'object') {
-    return JSON.stringify(value);
-  }
-  if (Array.isArray(value)) {
-    return `[${value.map((item) => canonicalJson(item)).join(',')}]`;
-  }
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map((item) => canonicalJson(item)).join(',')}]`;
   const object = value as Record<string, unknown>;
   return `{${Object.keys(object).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(object[key])}`).join(',')}}`;
 }
@@ -211,11 +219,9 @@ function clone<T>(value: T): T {
 }
 
 function responseActionId(raw: unknown): string {
-  if (raw !== null && typeof raw === 'object' && typeof (raw as Record<string, unknown>).actionId === 'string') {
-    const actionId = (raw as Record<string, unknown>).actionId;
-    return actionId as string;
-  }
-  return '';
+  return raw !== null && typeof raw === 'object' && typeof (raw as Record<string, unknown>).actionId === 'string'
+    ? (raw as Record<string, unknown>).actionId as string
+    : '';
 }
 
 function failure(
@@ -241,29 +247,10 @@ function socketAck(rawAck: unknown): AckCallback {
   return typeof rawAck === 'function' ? rawAck as AckCallback : () => undefined;
 }
 
-function publicSeat(seatId: SeatId, player: PlayerRecord, now: number): PublicSeat {
-  return {
-    seatId,
-    playerId: player.playerId,
-    nickname: player.nickname,
-    connected: true,
-    ready: false,
-    disconnectedAt: null,
-    reconnectDeadline: null,
-    disconnectDecisionAvailable: false,
-  };
-}
-
 function isAllowedOrigin(request: import('node:http').IncomingMessage): boolean {
   const origin = request.headers.origin;
-  if (origin === undefined) {
-    // Socket.IO clients and health probes do not send Origin. Browser WebSocket
-    // requests are still checked below.
-    return true;
-  }
-  if (origin === 'http://localhost:5173' || origin === 'http://127.0.0.1:5173' || origin === 'http://[::1]:5173') {
-    return true;
-  }
+  if (origin === undefined) return true;
+  if (origin === 'http://localhost:5173' || origin === 'http://127.0.0.1:5173' || origin === 'http://[::1]:5173') return true;
   try {
     const parsed = new URL(origin);
     const forwardedProtocol = request.headers['x-forwarded-proto'];
@@ -277,99 +264,8 @@ function isAllowedOrigin(request: import('node:http').IncomingMessage): boolean 
   }
 }
 
-class GameStore {
-  readonly rooms = new Map<string, RoomRecord>();
-  readonly roomsByInstance = new Map<string, RoomRecord>();
-  readonly players = new Map<string, PlayerRecord>();
-
-  createPlayer(nickname: string): PlayerRecord | null {
-    this.pruneInactivePlayers();
-    if (this.players.size >= MAX_PLAYERS) {
-      return null;
-    }
-    const secret = randomId(SECRET_BYTES);
-    const salt = randomId(16);
-    const player: PlayerRecord = {
-      playerId: randomId(PLAYER_ID_BYTES),
-      nickname: nickname.trim(),
-      secretSalt: salt,
-      secretHash: hashSecret(secret, salt),
-      activeSocketId: null,
-      controlEpoch: 0,
-      roomInstanceId: null,
-      createdAt: Date.now(),
-      lastSeenAt: Date.now(),
-      actionCache: new Map(),
-    };
-    this.players.set(player.playerId, player);
-    // The one-time cleartext is intentionally not retained in PlayerRecord.
-    Object.defineProperty(player, '__issuedSecret', { value: secret, enumerable: false, configurable: true });
-    return player;
-  }
-
-  issuedSecret(player: PlayerRecord): string | undefined {
-    const candidate = (player as PlayerRecord & { __issuedSecret?: string }).__issuedSecret;
-    if (candidate !== undefined) {
-      delete (player as PlayerRecord & { __issuedSecret?: string }).__issuedSecret;
-    }
-    return candidate;
-  }
-
-  createRoom(player: PlayerRecord): RoomRecord | null {
-    if (this.rooms.size >= MAX_ROOMS) {
-      return null;
-    }
-    let roomCode = makeRoomCode();
-    while (this.rooms.has(roomCode)) {
-      roomCode = makeRoomCode();
-    }
-    const now = Date.now();
-    const state: RoomState = {
-      roomCode,
-      roomInstanceId: randomId(ROOM_INSTANCE_BYTES),
-      version: 1,
-      phase: 'waiting',
-      seats: [publicSeat('A', player, now), null],
-      round: null,
-      faces: {},
-      drawing: null,
-      washProposal: null,
-      noConnectedPlayersSince: null,
-      createdAt: now,
-      updatedAt: now,
-    };
-    const room: RoomRecord = { state, pendingJoinPlayerIds: new Set([player.playerId]) };
-    this.rooms.set(state.roomCode, room);
-    this.roomsByInstance.set(state.roomInstanceId, room);
-    player.roomInstanceId = state.roomInstanceId;
-    return room;
-  }
-
-  pruneCache(player: PlayerRecord, now = Date.now()): void {
-    for (const [key, entry] of player.actionCache) {
-      if (now - entry.createdAt > ACTION_CACHE_TTL_MS) {
-        player.actionCache.delete(key);
-      }
-    }
-    while (player.actionCache.size > MAX_ACTIONS_PER_PLAYER) {
-      const oldest = player.actionCache.keys().next().value as string | undefined;
-      if (oldest === undefined) break;
-      player.actionCache.delete(oldest);
-    }
-  }
-
-  private pruneInactivePlayers(): void {
-    if (this.players.size < MAX_PLAYERS) return;
-    for (const [playerId, player] of this.players) {
-      if (this.players.size < MAX_PLAYERS) break;
-      if (player.activeSocketId === null && player.roomInstanceId === null) {
-        this.players.delete(playerId);
-      }
-    }
-  }
-}
-
 export function createGameServer(options: CreateGameServerOptions = {}): GameServer {
+  const now = options.now ?? Date.now;
   const app = express();
   app.disable('x-powered-by');
   app.get('/healthz', (_request, response) => response.status(200).type('text/plain').send('ok'));
@@ -377,7 +273,6 @@ export function createGameServer(options: CreateGameServerOptions = {}): GameSer
   if (options.serveStatic ?? true) {
     const clientDirectory = path.resolve(process.cwd(), 'dist/client');
     app.use(express.static(clientDirectory));
-    // Express 5 / path-to-regexp v8 requires a named wildcard.
     app.get('/r/{*roomPath}', (_request, response) => response.sendFile(path.join(clientDirectory, 'index.html')));
   }
 
@@ -386,109 +281,197 @@ export function createGameServer(options: CreateGameServerOptions = {}): GameSer
     maxHttpBufferSize: 16 * 1024,
     cors: { origin: true, credentials: false },
     allowRequest: (request, callback) => callback(null, isAllowedOrigin(request)),
+    // Heartbeats run every five seconds and time out after another five. Thus a
+    // dead transport is normally detected within roughly 5–10 seconds; business
+    // reconnect/forfeit windows are deliberately much longer and clock-driven.
+    pingInterval: 5_000,
+    pingTimeout: 5_000,
   });
-  const store = new GameStore();
+  const store = new GameStore({
+    now,
+    randomId,
+    makeRoomCode,
+    hashSecret,
+    maxRooms: MAX_ROOMS,
+    maxPlayers: MAX_PLAYERS,
+    maxActionsPerPlayer: MAX_ACTIONS_PER_PLAYER,
+    actionCacheTtlMs: ACTION_CACHE_TTL_MS,
+  });
   const serverEpoch = randomId(SERVER_EPOCH_BYTES);
   const rateBuckets = new WeakMap<GameSocket, RateBucket>();
-  const inFlightActions = new WeakMap<PlayerRecord, Map<string, {
-    fingerprint: string;
-    response: Promise<AckResult<unknown>>;
-  }>>();
+  // This is actor-scoped—not socket-scoped—so concurrent retries after a tab
+  // handoff still share one actionId reservation.
+  const inFlightActions = new WeakMap<PlayerRecord, Map<string, InFlightAction>>();
+  const memberOperations = new MemberOperations();
+
+  const actionFingerprint = (event: string, hash: string): string => `${event}\u0000${hash}`;
 
   const rateLimited = (socket: GameSocket): boolean => {
-    const now = Date.now();
+    const timestamp = now();
     const bucket = rateBuckets.get(socket) ?? { timestamps: [] };
-    bucket.timestamps = bucket.timestamps.filter((timestamp) => now - timestamp < RATE_WINDOW_MS);
+    bucket.timestamps = bucket.timestamps.filter((seenAt) => timestamp - seenAt < RATE_WINDOW_MS);
     if (bucket.timestamps.length >= RATE_MAX_REQUESTS) {
       rateBuckets.set(socket, bucket);
       return true;
     }
-    bucket.timestamps.push(now);
+    bucket.timestamps.push(timestamp);
     rateBuckets.set(socket, bucket);
     return false;
   };
-
-  const actionFingerprint = (event: string, hash: string): string => `${event}\u0000${hash}`;
 
   const getCached = (player: PlayerRecord, event: string, actionId: string, hash: string): AckResult<unknown> | 'reused' | null => {
     store.pruneCache(player);
     const entry = player.actionCache.get(actionId);
     if (entry === undefined) return null;
-    return entry.payloadHash === actionFingerprint(event, hash) ? clone(entry.response) : 'reused';
+    return entry.payloadHash === actionFingerprint(event, hash) ? clone(entry.response as AckResult<unknown>) : 'reused';
   };
 
   const cacheResponse = (player: PlayerRecord, event: string, actionId: string, hash: string, response: AckResult<unknown>): void => {
-    player.actionCache.set(actionId, { payloadHash: actionFingerprint(event, hash), response: clone(response), createdAt: Date.now() });
+    player.actionCache.set(actionId, {
+      payloadHash: actionFingerprint(event, hash),
+      response: clone(response),
+      createdAt: now(),
+    });
     store.pruneCache(player);
   };
 
-  const actorForSocket = (socket: GameSocket, actionId: string): PlayerRecord | AckResult<never> => {
-    const playerId = socket.data.playerId;
-    const controlEpoch = socket.data.controlEpoch;
-    if (playerId === undefined || controlEpoch === undefined) {
-      return failure(actionId, 'AUTH_REQUIRED', '请先建立会话。');
-    }
-    const player = store.players.get(playerId);
-    if (player === undefined) {
-      return failure(actionId, 'IDENTITY_EXPIRED', '身份已失效，请重新建立会话。');
-    }
-    if (player.activeSocketId !== socket.id || player.controlEpoch !== controlEpoch) {
-      return failure(actionId, 'SESSION_REPLACED', '此标签页已被新的控制连接接管。');
-    }
-    player.lastSeenAt = Date.now();
-    return player;
+  const commit = (room: RoomRecord, changes: RoomChanges, causedByActionId?: string): PatchMessage => {
+    const previousVersion = room.state.version;
+    const timestamp = now();
+    room.state.version += 1;
+    room.state.updatedAt = timestamp;
+    const patchChanges: RoomChanges = { ...changes, updatedAt: timestamp };
+    return {
+      roomInstanceId: room.state.roomInstanceId,
+      prevVersion: previousVersion,
+      version: room.state.version,
+      serverTime: timestamp,
+      ...(causedByActionId === undefined ? {} : { causedByActionId }),
+      changes: clone(patchChanges),
+    };
   };
-
-  const isFailure = (value: PlayerRecord | AckResult<never>): value is AckResult<never> => !('playerId' in value);
-
-  const memberRoom = (socket: GameSocket, player: PlayerRecord, roomInstanceId: string, actionId: string): RoomRecord | AckResult<never> => {
-    if (player.roomInstanceId !== roomInstanceId) {
-      return failure(actionId, 'NOT_IN_ROOM', '你不在该房间中。');
-    }
-    const room = store.roomsByInstance.get(roomInstanceId);
-    if (room === undefined || room.pendingJoinPlayerIds.has(player.playerId) || !socket.rooms.has(roomInstanceId)) {
-      return failure(actionId, 'NOT_IN_ROOM', '你不在该房间中。');
-    }
-    if (!room.state.seats.some((seat) => seat?.playerId === player.playerId)) {
-      return failure(actionId, 'SEAT_RELEASED', '你的座位已失效。');
-    }
-    return room;
-  };
-
-  const isRoomFailure = (value: RoomRecord | AckResult<never>): value is AckResult<never> => !('state' in value);
 
   const snapshot = (socket: GameSocket, room: RoomRecord, syncRequestId?: string): void => {
     const message: SnapshotMessage = {
       roomInstanceId: room.state.roomInstanceId,
       version: room.state.version,
-      serverTime: Date.now(),
+      serverTime: now(),
       ...(syncRequestId === undefined ? {} : { syncRequestId }),
       state: clone(room.state),
     };
     socket.emit('room:snapshot', message);
   };
 
-  const commit = (room: RoomRecord, changes: RoomChanges, causedByActionId?: string): PatchMessage => {
-    const previousVersion = room.state.version;
-    room.state.version += 1;
-    room.state.updatedAt = Date.now();
-    const patchChanges: RoomChanges = { ...changes, updatedAt: room.state.updatedAt };
-    return {
-      roomInstanceId: room.state.roomInstanceId,
-      prevVersion: previousVersion,
-      version: room.state.version,
-      serverTime: Date.now(),
-      ...(causedByActionId === undefined ? {} : { causedByActionId }),
-      changes: clone(patchChanges),
-    };
+  const broadcastPatch = (room: RoomRecord, patch: PatchMessage, except?: GameSocket): void => {
+    if (except === undefined) io.to(room.state.roomInstanceId).emit('room:patch', patch);
+    else except.to(room.state.roomInstanceId).emit('room:patch', patch);
   };
 
-  const broadcastPatch = (room: RoomRecord, patch: PatchMessage, except?: GameSocket): void => {
-    // Every gameplay update is scoped to this exact room instance, never io.emit().
-    if (except === undefined) {
-      io.to(room.state.roomInstanceId).emit('room:patch', patch);
-    } else {
-      except.to(room.state.roomInstanceId).emit('room:patch', patch);
+  const roomChanges = (room: RoomRecord, includeRound = false): RoomChanges => ({
+    seats: clone(room.state.seats),
+    ...(includeRound && room.state.round !== null ? { round: clone(room.state.round) } : {}),
+    washProposal: clone(room.state.washProposal),
+    noConnectedPlayersSince: room.state.noConnectedPlayersSince,
+  });
+
+  const actorForSocket = (socket: GameSocket, actionId: string): PlayerRecord | AckResult<never> => {
+    const playerId = socket.data.playerId;
+    const controlEpoch = socket.data.controlEpoch;
+    if (playerId === undefined || controlEpoch === undefined) return failure(actionId, 'AUTH_REQUIRED', '请先建立会话。');
+    const player = store.players.get(playerId);
+    if (player === undefined) return failure(actionId, 'IDENTITY_EXPIRED', '身份已失效，请重新建立会话。');
+    if (player.activeSocketId !== socket.id || player.controlEpoch !== controlEpoch) {
+      return failure(actionId, 'SESSION_REPLACED', '此标签页已被新的控制连接接管。');
+    }
+    player.lastSeenAt = now();
+    return player;
+  };
+
+  const isFailure = (value: PlayerRecord | AckResult<never>): value is AckResult<never> => !('playerId' in value);
+
+  const memberRoom = (socket: GameSocket, player: PlayerRecord, roomInstanceId: string, actionId: string): RoomRecord | AckResult<never> => {
+    if (player.roomInstanceId !== roomInstanceId) return failure(actionId, 'NOT_IN_ROOM', '你不在该房间中。');
+    const room = store.roomsByInstance.get(roomInstanceId);
+    if (room === undefined) return failure(actionId, 'ROOM_EXPIRED', '房间已经过期。');
+    if (room.pendingMemberPlayerIds.has(player.playerId) || !socket.rooms.has(roomInstanceId)) {
+      return failure(actionId, 'NOT_IN_ROOM', '你不在该房间中。');
+    }
+    if (seatForPlayer(room.state, player.playerId) === null) return failure(actionId, 'SEAT_RELEASED', '你的座位已失效。');
+    return room;
+  };
+
+  const isRoomFailure = (value: RoomRecord | AckResult<never>): value is AckResult<never> => !('state' in value);
+
+  const continuationFailure = (socket: GameSocket, player: PlayerRecord, room: RoomRecord, lease: symbol, actionId: string): AckResult<never> | null => {
+    const actor = actorForSocket(socket, actionId);
+    if (isFailure(actor)) return actor;
+    if (!socket.connected) return failure(actionId, 'AUTH_REQUIRED', '连接已断开。', true);
+    if (store.roomsByInstance.get(room.state.roomInstanceId) !== room) return failure(actionId, 'ROOM_EXPIRED', '房间已经失效。');
+    if (player.roomInstanceId !== room.state.roomInstanceId || seatForPlayer(room.state, player.playerId) === null) {
+      return failure(actionId, 'SEAT_RELEASED', '原座位已失效。');
+    }
+    if (!memberOperations.owns(room, player.playerId, lease)) return failure(actionId, 'INVALID_PHASE', '成员操作已被新的恢复请求替换。', true);
+    return null;
+  };
+
+  const removeObsoleteMembership = async (socket: GameSocket, room: RoomRecord): Promise<void> => {
+    try {
+      await socket.leave(room.state.roomInstanceId);
+    } catch {
+      // A superseded connection must never remain subscribed to state broadcasts.
+      socket.disconnect(true);
+    }
+  };
+
+  const markSeatOffline = (room: RoomRecord, player: PlayerRecord): PatchMessage | null => {
+    const seat = seatForPlayer(room.state, player.playerId);
+    if (seat === null || !seat.connected) return null;
+    const timestamp = now();
+    seat.connected = false;
+    seat.disconnectedAt = timestamp;
+    seat.reconnectDeadline = timestamp + RECONNECT_GRACE_MS;
+    seat.disconnectDecisionAvailable = false;
+    clearReady(room.state);
+    room.state.washProposal = null;
+    let includeRound = false;
+    if (room.state.phase === 'playing' && room.state.round !== null) {
+      room.state.round.paused = true;
+      includeRound = true;
+    }
+    updateNoConnectedPlayersSince(room.state, timestamp);
+    return commit(room, roomChanges(room, includeRound));
+  };
+
+  const ownedRoomEntry = (player: PlayerRecord): RoomEntryData | null => {
+    if (player.roomInstanceId === null) return null;
+    const room = store.roomsByInstance.get(player.roomInstanceId);
+    if (room === undefined || seatForPlayer(room.state, player.playerId) === null) return null;
+    return roomEntry(room.state);
+  };
+
+  const runMaintenance = (): void => {
+    const timestamp = now();
+    for (const room of [...store.rooms.values()]) {
+      if (room.state.noConnectedPlayersSince !== null
+          && timestamp - room.state.noConnectedPlayersSince >= ROOM_IDLE_TTL_MS) {
+        io.to(room.state.roomInstanceId).emit('room:expired', { message: '房间因双方离线过久已失效。' });
+        store.removeRoom(room);
+        continue;
+      }
+      let eligibilityChanged = false;
+      for (const seat of room.state.seats) {
+        if (seat === null) continue;
+        const available = room.state.phase === 'playing' && !seat.connected
+          && seat.reconnectDeadline !== null && timestamp >= seat.reconnectDeadline;
+        if (seat.disconnectDecisionAvailable !== available) {
+          seat.disconnectDecisionAvailable = available;
+          eligibilityChanged = true;
+        }
+      }
+      if (eligibilityChanged) {
+        const patch = commit(room, roomChanges(room));
+        broadcastPatch(room, patch);
+      }
     }
   };
 
@@ -499,7 +482,9 @@ export function createGameServer(options: CreateGameServerOptions = {}): GameSer
     rawAck: unknown,
     schema: z.ZodType<T>,
     handler: (player: PlayerRecord, request: T) => Promise<AckResult<unknown>> | AckResult<unknown>,
+    onCached?: (player: PlayerRecord, request: T, response: AckResult<unknown>) => Promise<void> | void,
   ): Promise<void> => {
+    runMaintenance();
     const ack = socketAck(rawAck);
     const actionId = responseActionId(rawRequest);
     const actor = actorForSocket(socket, actionId);
@@ -513,37 +498,34 @@ export function createGameServer(options: CreateGameServerOptions = {}): GameSer
       return;
     }
     const request = parsed.data;
+    const requestId = (request as { actionId: string }).actionId;
     const hash = payloadHash(rawRequest);
-    const cached = getCached(actor, event, (request as { actionId: string }).actionId, hash);
+    const cached = getCached(actor, event, requestId, hash);
     if (cached === 'reused') {
-      ack(failure((request as { actionId: string }).actionId, 'ACTION_ID_REUSED', '同一 actionId 不能用于不同请求。'));
+      ack(failure(requestId, 'ACTION_ID_REUSED', '同一 actionId 不能用于不同请求。'));
       return;
     }
     if (cached !== null) {
+      await onCached?.(actor, request, cached);
       ack(cached);
       return;
     }
-    const requestId = (request as { actionId: string }).actionId;
+
     const fingerprint = actionFingerprint(event, hash);
-    const pendingActions = inFlightActions.get(actor) ?? new Map();
+    const pendingActions = inFlightActions.get(actor) ?? new Map<string, InFlightAction>();
     const pending = pendingActions.get(requestId);
     if (pending !== undefined) {
-      if (pending.fingerprint !== fingerprint) {
-        ack(failure(requestId, 'ACTION_ID_REUSED', '同一 actionId 不能用于不同请求。'));
-      } else {
-        ack(clone(await pending.response));
-      }
+      if (pending.fingerprint !== fingerprint) ack(failure(requestId, 'ACTION_ID_REUSED', '同一 actionId 不能用于不同请求。'));
+      else ack(clone(await pending.response));
       return;
     }
     if (rateLimited(socket)) {
-      const response = failure((request as { actionId: string }).actionId, 'RATE_LIMITED', '请求过于频繁，请稍后重试。', true);
-      cacheResponse(actor, event, (request as { actionId: string }).actionId, hash, response);
+      const response = failure(requestId, 'RATE_LIMITED', '请求过于频繁，请稍后重试。', true);
+      cacheResponse(actor, event, requestId, hash, response);
       ack(response);
       return;
     }
 
-    // Reserve the intent before a handler can yield (e.g. socket.join).
-    // Concurrent retries await this exact result instead of executing again.
     let resolvePending!: (result: AckResult<unknown>) => void;
     const pendingResponse = new Promise<AckResult<unknown>>((resolve) => { resolvePending = resolve; });
     pendingActions.set(requestId, { fingerprint, response: pendingResponse });
@@ -552,15 +534,16 @@ export function createGameServer(options: CreateGameServerOptions = {}): GameSer
     try {
       response = await handler(actor, request);
     } catch {
-      response = failure((request as { actionId: string }).actionId, 'INTERNAL_ERROR', '服务器暂时无法处理该请求。', true);
+      response = failure(requestId, 'INTERNAL_ERROR', '服务器暂时无法处理该请求。', true);
     }
-    cacheResponse(actor, event, (request as { actionId: string }).actionId, hash, response);
+    cacheResponse(actor, event, requestId, hash, response);
     resolvePending(clone(response));
     pendingActions.delete(requestId);
     ack(response);
   };
 
   const handleSessionOpen = async (socket: GameSocket, rawRequest: unknown, rawAck: unknown): Promise<void> => {
+    runMaintenance();
     const ack = socketAck(rawAck);
     const actionId = responseActionId(rawRequest);
     const parsed = sessionOpenSchema.safeParse(rawRequest);
@@ -574,176 +557,296 @@ export function createGameServer(options: CreateGameServerOptions = {}): GameSer
       return;
     }
 
-    const alreadyAuthenticatedId = socket.data.playerId;
-    if (alreadyAuthenticatedId !== undefined) {
+    if (socket.data.playerId !== undefined) {
       const existing = actorForSocket(socket, request.actionId);
       if (isFailure(existing)) {
         ack(existing);
         return;
       }
-      const existingHash = payloadHash(rawRequest);
-      const cached = getCached(existing, 'session:open', request.actionId, existingHash);
-      if (cached === 'reused') {
-        ack(failure(request.actionId, 'ACTION_ID_REUSED', '同一 actionId 不能用于不同请求。'));
-      } else if (cached !== null) {
-        ack(cached);
-      } else {
-        // A connected tab cannot switch into another identity and thereby inherit it.
-        ack(failure(request.actionId, 'AUTH_INVALID', '已认证连接不能切换身份。'));
-      }
+      const hash = payloadHash(rawRequest);
+      const cached = getCached(existing, 'session:open', request.actionId, hash);
+      if (cached === 'reused') ack(failure(request.actionId, 'ACTION_ID_REUSED', '同一 actionId 不能用于不同请求。'));
+      else if (cached !== null) ack(cached);
+      else ack(failure(request.actionId, 'AUTH_INVALID', '已认证连接不能切换身份。'));
       return;
     }
-
     if (rateLimited(socket)) {
       ack(failure(request.actionId, 'RATE_LIMITED', '身份请求过于频繁，请稍后重试。', true));
       return;
     }
+
     let player: PlayerRecord;
     let issuedSecret: string | undefined;
     if (request.playerId !== undefined && request.secret !== undefined) {
       const recoveredPlayer = store.players.get(request.playerId);
-      if (recoveredPlayer === undefined || !secretMatches(request.secret, recoveredPlayer.secretSalt, recoveredPlayer.secretHash)) {
+      if (recoveredPlayer === undefined) {
+        ack(failure(request.actionId, 'IDENTITY_EXPIRED', '身份已失效，请重新建立会话。'));
+        return;
+      }
+      if (!secretMatches(request.secret, recoveredPlayer.secretSalt, recoveredPlayer.secretHash)) {
         ack(failure(request.actionId, 'AUTH_INVALID', '身份凭据无效。'));
         return;
       }
       player = recoveredPlayer;
     } else {
-      const newPlayer = store.createPlayer(request.nickname ?? '');
-      if (newPlayer === null) {
+      const created = store.createPlayer(request.nickname ?? '');
+      if (created === null) {
         ack(failure(request.actionId, 'RATE_LIMITED', '服务器暂时无法创建更多身份。', true));
         return;
       }
-      player = newPlayer;
-      issuedSecret = store.issuedSecret(player);
+      player = created.player;
+      issuedSecret = created.secret;
     }
 
+    // Advance epoch before any await: the old controller can no longer leave or
+    // move while its Socket.IO membership is being removed.
     const oldSocketId = player.activeSocketId;
+    player.controlEpoch += 1;
+    player.activeSocketId = socket.id;
+    player.lastSeenAt = now();
+    socket.data.playerId = player.playerId;
+    socket.data.controlEpoch = player.controlEpoch;
     if (oldSocketId !== null && oldSocketId !== socket.id) {
       const oldSocket = io.sockets.sockets.get(oldSocketId) as GameSocket | undefined;
       if (oldSocket !== undefined) {
         oldSocket.emit('session:replaced', { message: '此标签页已被新的控制连接接管。' });
-        if (player.roomInstanceId !== null) {
-          oldSocket.leave(player.roomInstanceId);
+        const previousRoom = player.roomInstanceId === null ? undefined : store.roomsByInstance.get(player.roomInstanceId);
+        if (previousRoom !== undefined) await removeObsoleteMembership(oldSocket, previousRoom);
+        else oldSocket.disconnect(true);
+      }
+      const currentActor = actorForSocket(socket, request.actionId);
+      if (isFailure(currentActor)) {
+        ack(currentActor);
+        return;
+      }
+      // session:open deliberately does not auto-resume a room. The seat becomes
+      // offline until room:resume has joined this current controller and sent a
+      // full snapshot, preventing pre-snapshot play by a new tab.
+      if (player.roomInstanceId !== null) {
+        const room = store.roomsByInstance.get(player.roomInstanceId);
+        if (room !== undefined) {
+          const patch = markSeatOffline(room, player);
+          if (patch !== null) broadcastPatch(room, patch);
         }
       }
     }
-    player.controlEpoch += 1;
-    player.activeSocketId = socket.id;
-    player.lastSeenAt = Date.now();
-    socket.data.playerId = player.playerId;
-    socket.data.controlEpoch = player.controlEpoch;
 
     const response = success<SessionData>(request.actionId, {
       playerId: player.playerId,
       nickname: player.nickname,
       ...(issuedSecret === undefined ? {} : { secret: issuedSecret }),
       serverEpoch,
-      serverTime: Date.now(),
+      serverTime: now(),
+      room: ownedRoomEntry(player),
     });
     cacheResponse(player, 'session:open', request.actionId, payloadHash(rawRequest), response);
     ack(response);
   };
 
   const createRoom = async (socket: GameSocket, player: PlayerRecord, request: { actionId: string }): Promise<AckResult<RoomEntryData>> => {
-    if (player.roomInstanceId !== null) {
-      return failure(request.actionId, 'ALREADY_IN_ROOM', '你已经在一个房间中。');
-    }
-    const room = store.createRoom(player);
-    if (room === null) {
-      return failure(request.actionId, 'RATE_LIMITED', '服务器暂时无法创建更多房间。', true);
-    }
+    if (player.roomInstanceId !== null) return failure(request.actionId, 'ALREADY_IN_ROOM', '你已经在一个房间中。');
+    const identity = store.nextRoomIdentity();
+    const timestamp = now();
+    const state: RoomState = {
+      roomCode: identity.roomCode,
+      roomInstanceId: identity.roomInstanceId,
+      version: 1,
+      phase: 'waiting',
+      seats: [publicSeat('A', player), null],
+      round: null,
+      faces: {},
+      drawing: null,
+      washProposal: null,
+      noConnectedPlayersSince: null,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    };
+    const room = store.createRoom(state, player);
+    if (room === null) return failure(request.actionId, 'RATE_LIMITED', '服务器暂时无法创建更多房间。', true);
+    const lease = memberOperations.begin(room, player.playerId, socket.id, player.controlEpoch)!;
     try {
-      // Seat reservation happens synchronously in createRoom before this await.
       await socket.join(room.state.roomInstanceId);
-      room.pendingJoinPlayerIds.delete(player.playerId);
     } catch {
+      await removeObsoleteMembership(socket, room);
+      const invalid = continuationFailure(socket, player, room, lease, request.actionId);
+      memberOperations.finish(room, player.playerId, lease);
+      if (invalid !== null) return invalid;
+      io.to(room.state.roomInstanceId).emit('room:expired', { message: '房间创建失败，原房间已失效。' });
+      store.removeRoom(room);
       return failure(request.actionId, 'INTERNAL_ERROR', '加入新房间失败。', true);
     }
+    const invalid = continuationFailure(socket, player, room, lease, request.actionId);
+    if (invalid !== null) {
+      await removeObsoleteMembership(socket, room);
+      memberOperations.finish(room, player.playerId, lease);
+      return invalid;
+    }
     snapshot(socket, room);
-    return success(request.actionId, {
-      roomCode: room.state.roomCode,
-      roomInstanceId: room.state.roomInstanceId,
-      invitationPath: `/r/${room.state.roomCode}`,
-    }, room.state.version);
+    memberOperations.finish(room, player.playerId, lease);
+    return success(request.actionId, roomEntry(room.state), room.state.version);
   };
 
   const joinRoom = async (socket: GameSocket, player: PlayerRecord, request: JoinRequest): Promise<AckResult<RoomEntryData>> => {
-    if (player.roomInstanceId !== null) {
-      return failure(request.actionId, 'ALREADY_IN_ROOM', '你已经在一个房间中。');
-    }
+    if (player.roomInstanceId !== null) return failure(request.actionId, 'ALREADY_IN_ROOM', '你已经在一个房间中。');
     const room = store.rooms.get(request.roomCode);
-    if (room === undefined) {
-      return failure(request.actionId, 'ROOM_NOT_FOUND', '房间不存在。');
-    }
+    if (room === undefined) return failure(request.actionId, 'ROOM_NOT_FOUND', '房间不存在。');
     const seatIndex = room.state.seats.findIndex((seat) => seat === null);
-    if (seatIndex === -1) {
-      // Do not join the Socket.IO room or emit a snapshot before this check.
-      return failure(request.actionId, 'ROOM_FULL', '房间已满，请创建新房间。');
-    }
+    if (seatIndex === -1) return failure(request.actionId, 'ROOM_FULL', '房间已满，请创建新房间。');
 
+    const lease = memberOperations.begin(room, player.playerId, socket.id, player.controlEpoch);
+    if (lease === null) return failure(request.actionId, 'INVALID_PHASE', '成员操作正在处理中，请稍候。', true);
+    const previousNoConnectedPlayersSince = room.state.noConnectedPlayersSince;
     const seatId: SeatId = seatIndex === 0 ? 'A' : 'B';
-    // This is the atomic reservation. JavaScript runs this whole section before
-    // the await below, so a concurrent third join sees the occupied seat.
-    room.state.seats[seatIndex] = publicSeat(seatId, player, Date.now());
+    room.state.seats[seatIndex] = publicSeat(seatId, player);
     player.roomInstanceId = room.state.roomInstanceId;
-    room.pendingJoinPlayerIds.add(player.playerId);
-    const patch = commit(room, { seats: clone(room.state.seats) }, request.actionId);
+    updateNoConnectedPlayersSince(room.state, now());
+    const reservationPatch = commit(room, roomChanges(room), request.actionId);
+    // Existing authorized members learn the reservation before join awaits. The
+    // pending gate prevents the not-yet-joined socket from acting on it.
+    broadcastPatch(room, reservationPatch);
 
     try {
       await socket.join(room.state.roomInstanceId);
-      room.pendingJoinPlayerIds.delete(player.playerId);
     } catch {
+      await removeObsoleteMembership(socket, room);
+      const invalid = continuationFailure(socket, player, room, lease, request.actionId);
+      if (invalid !== null) {
+        memberOperations.finish(room, player.playerId, lease);
+        return invalid;
+      }
+      room.state.seats[seatIndex] = null;
+      player.roomInstanceId = null;
+      room.state.noConnectedPlayersSince = previousNoConnectedPlayersSince;
+      updateNoConnectedPlayersSince(room.state, now());
+      const rollbackPatch = commit(room, roomChanges(room), request.actionId);
+      broadcastPatch(room, rollbackPatch);
+      memberOperations.finish(room, player.playerId, lease);
       return failure(request.actionId, 'INTERNAL_ERROR', '加入房间失败。', true);
     }
-    broadcastPatch(room, patch, socket);
+    const invalid = continuationFailure(socket, player, room, lease, request.actionId);
+    if (invalid !== null) {
+      await removeObsoleteMembership(socket, room);
+      memberOperations.finish(room, player.playerId, lease);
+      return invalid;
+    }
+    // A real new member, unlike a failed reservation above, invalidates both
+    // readiness and any M3 wash proposal. Keep its gate closed until the
+    // resulting state is on the socket's event queue.
+    const hadReady = room.state.seats.some((candidate) => candidate?.ready === true);
+    if (hadReady || room.state.washProposal !== null) {
+      clearReady(room.state);
+      room.state.washProposal = null;
+      const memberPatch = commit(room, roomChanges(room), request.actionId);
+      broadcastPatch(room, memberPatch);
+    }
     snapshot(socket, room);
-    return success(request.actionId, {
-      roomCode: room.state.roomCode,
-      roomInstanceId: room.state.roomInstanceId,
-      invitationPath: `/r/${room.state.roomCode}`,
-    }, room.state.version);
+    memberOperations.finish(room, player.playerId, lease);
+    return success(request.actionId, roomEntry(room.state), room.state.version);
+  };
+
+  const resumeRoom = async (socket: GameSocket, player: PlayerRecord, request: ResumeRequest): Promise<AckResult<RoomEntryData>> => {
+    // Resolve by code first and require the exact, non-reusable instance before
+    // inspecting any seat. A third identity receives no state on any failure.
+    const room = store.rooms.get(request.roomCode);
+    if (room === undefined || room.state.roomInstanceId !== request.roomInstanceId) {
+      return failure(request.actionId, 'ROOM_EXPIRED', '房间已经失效，不能恢复到新实例。');
+    }
+    if (player.roomInstanceId !== request.roomInstanceId) return failure(request.actionId, 'SEAT_RELEASED', '原座位已失效。');
+    const seat = seatForPlayer(room.state, player.playerId);
+    if (seat === null) return failure(request.actionId, 'SEAT_RELEASED', '原座位已失效。');
+
+    // A distinct resume action after transport uncertainty must always send a
+    // snapshot, even if its current controller is already online.
+    if (seat.connected && socket.rooms.has(room.state.roomInstanceId) && !room.pendingMemberPlayerIds.has(player.playerId)) {
+      snapshot(socket, room, request.syncRequestId);
+      return success(request.actionId, roomEntry(room.state), room.state.version);
+    }
+
+    const lease = memberOperations.begin(room, player.playerId, socket.id, player.controlEpoch);
+    if (lease === null) return failure(request.actionId, 'INVALID_PHASE', '成员操作正在处理中，请稍候。', true);
+    const priorSeat = clone(seat);
+    const previousNoConnectedPlayersSince = room.state.noConnectedPlayersSince;
+    seat.connected = true;
+    seat.disconnectedAt = null;
+    seat.reconnectDeadline = null;
+    seat.disconnectDecisionAvailable = false;
+    updateNoConnectedPlayersSince(room.state, now());
+    // Keep a playing round paused through join and the mandatory snapshot. It
+    // eliminates a pre-snapshot action window for the reconnecting controller.
+    const onlinePatch = commit(room, roomChanges(room), request.actionId);
+    broadcastPatch(room, onlinePatch);
+
+    try {
+      await socket.join(room.state.roomInstanceId);
+    } catch {
+      await removeObsoleteMembership(socket, room);
+      const invalid = continuationFailure(socket, player, room, lease, request.actionId);
+      if (invalid !== null) {
+        memberOperations.finish(room, player.playerId, lease);
+        return invalid;
+      }
+      Object.assign(seat, priorSeat);
+      room.state.noConnectedPlayersSince = previousNoConnectedPlayersSince;
+      updateNoConnectedPlayersSince(room.state, now());
+      const rollbackPatch = commit(room, roomChanges(room), request.actionId);
+      broadcastPatch(room, rollbackPatch);
+      memberOperations.finish(room, player.playerId, lease);
+      return failure(request.actionId, 'INTERNAL_ERROR', '恢复房间失败。', true);
+    }
+    const invalid = continuationFailure(socket, player, room, lease, request.actionId);
+    if (invalid !== null) {
+      await removeObsoleteMembership(socket, room);
+      memberOperations.finish(room, player.playerId, lease);
+      return invalid;
+    }
+
+    // While the snapshot is emitted, the pending gate remains active. It opens
+    // only once that complete pre-unpause state is on this socket's event queue.
+    snapshot(socket, room, request.syncRequestId);
+    memberOperations.finish(room, player.playerId, lease);
+    if (room.state.phase === 'playing' && room.state.round !== null && seatsAreOnline(room.state) && room.state.round.paused) {
+      room.state.round.paused = false;
+      const unpausePatch = commit(room, roomChanges(room, true), request.actionId);
+      broadcastPatch(room, unpausePatch);
+      return success(request.actionId, roomEntry(room.state), unpausePatch.version);
+    }
+    return success(request.actionId, roomEntry(room.state), room.state.version);
+  };
+
+  const replayCachedResume = (socket: GameSocket, player: PlayerRecord, request: ResumeRequest, response: AckResult<unknown>): void => {
+    if (!response.ok || player.roomInstanceId !== request.roomInstanceId) return;
+    const room = store.rooms.get(request.roomCode);
+    if (room === undefined || room.state.roomInstanceId !== request.roomInstanceId) return;
+    if (seatForPlayer(room.state, player.playerId) !== null && socket.rooms.has(room.state.roomInstanceId)) {
+      snapshot(socket, room, request.syncRequestId);
+    }
   };
 
   const setReady = (socket: GameSocket, player: PlayerRecord, request: ReadyRequest): AckResult => {
     const member = memberRoom(socket, player, request.roomInstanceId, request.actionId);
     if (isRoomFailure(member)) return member;
     const room = member;
-    if (room.state.phase !== 'waiting') {
+    if (room.state.phase !== 'waiting' && room.state.phase !== 'finished') {
       return failure(request.actionId, 'INVALID_PHASE', '当前阶段不能准备。');
     }
-    if (request.roundId !== null) {
-      return failure(request.actionId, 'STALE_ROUND', '准备请求引用了过期对局。', false, true);
+    if (room.pendingMemberPlayerIds.size > 0) {
+      return failure(request.actionId, 'GAME_PAUSED', '成员正在切换连接或离开，请稍后重新准备。', true);
     }
-    const seatIndex = room.state.seats.findIndex((seat) => seat?.playerId === player.playerId);
-    const seat = room.state.seats[seatIndex];
-    if (seat === undefined || seat === null) {
-      return failure(request.actionId, 'SEAT_RELEASED', '你的座位已失效。');
-    }
-    if (seat.ready === request.ready) {
-      return success(request.actionId, undefined, room.state.version);
-    }
+    const expectedRoundId = room.state.round?.roundId ?? null;
+    if (request.roundId !== expectedRoundId) return failure(request.actionId, 'STALE_ROUND', '准备请求引用了过期对局。', false, true);
+    const seat = seatForPlayer(room.state, player.playerId);
+    if (seat === null) return failure(request.actionId, 'SEAT_RELEASED', '你的座位已失效。');
+    if (seat.ready === request.ready) return success(request.actionId, undefined, room.state.version);
 
     seat.ready = request.ready;
     const [seatA, seatB] = room.state.seats;
-    let changes: RoomChanges = { seats: clone(room.state.seats) };
-    if (seatA !== null && seatB !== null && seatA.connected && seatB.connected && seatA.ready && seatB.ready) {
-      const round: PublicRound = {
-        roundId: randomId(ROUND_ID_BYTES),
-        participantIds: [seatA.playerId, seatB.playerId],
-        blackPlayerId: seatA.playerId,
-        whitePlayerId: seatB.playerId,
-        board: Array<Cell>(BOARD_CELLS).fill(0),
-        moveNo: 0,
-        turnPlayerId: seatA.playerId,
-        lastMove: null,
-        paused: false,
-        result: null,
-      };
+    let changes: RoomChanges = roomChanges(room);
+    if (seatA !== null && seatB !== null && seatsAreOnline(room.state) && seatA.ready && seatB.ready) {
+      const round = createRound(room.state.round, [seatA, seatB], randomId(ROUND_ID_BYTES));
       room.state.phase = 'playing';
       room.state.round = round;
-      seatA.ready = false;
-      seatB.ready = false;
-      changes = { phase: room.state.phase, seats: clone(room.state.seats), round: clone(round) };
+      clearReady(room.state);
+      changes = { phase: room.state.phase, ...roomChanges(room, true) };
     }
     const patch = commit(room, changes, request.actionId);
     broadcastPatch(room, patch);
@@ -755,28 +858,14 @@ export function createGameServer(options: CreateGameServerOptions = {}): GameSer
     if (isRoomFailure(member)) return member;
     const room = member;
     const round = room.state.round;
-    if (round === null || round.roundId !== request.roundId) {
-      return failure(request.actionId, 'STALE_ROUND', '该对局已经过期。', false, true);
-    }
-    if (room.state.phase !== 'playing') {
-      return failure(request.actionId, 'INVALID_PHASE', '当前阶段不能落子。', false, true);
-    }
-    if (round.paused) {
-      return failure(request.actionId, 'GAME_PAUSED', '对局已暂停。', true, true);
-    }
-    if (!round.participantIds.includes(player.playerId)) {
-      return failure(request.actionId, 'SEAT_RELEASED', '你不是本局参与者。');
-    }
-    if (round.turnPlayerId !== player.playerId) {
-      return failure(request.actionId, 'NOT_YOUR_TURN', '尚未轮到你落子。', false, true);
-    }
-    if (request.expectedMoveNo !== round.moveNo) {
-      return failure(request.actionId, 'STALE_MOVE', '落子序号已过期。', false, true);
-    }
+    if (round === null || round.roundId !== request.roundId) return failure(request.actionId, 'STALE_ROUND', '该对局已经过期。', false, true);
+    if (room.state.phase !== 'playing') return failure(request.actionId, 'INVALID_PHASE', '当前阶段不能落子。', false, true);
+    if (round.paused) return failure(request.actionId, 'GAME_PAUSED', '对局已暂停。', true, true);
+    if (!round.participantIds.includes(player.playerId)) return failure(request.actionId, 'SEAT_RELEASED', '你不是本局参与者。');
+    if (round.turnPlayerId !== player.playerId) return failure(request.actionId, 'NOT_YOUR_TURN', '尚未轮到你落子。', false, true);
+    if (request.expectedMoveNo !== round.moveNo) return failure(request.actionId, 'STALE_MOVE', '落子序号已过期。', false, true);
     const index = boardIndex(request.x, request.y);
-    if (round.board[index] !== 0) {
-      return failure(request.actionId, 'CELL_OCCUPIED', '该位置已有棋子。', false, true);
-    }
+    if (round.board[index] !== 0) return failure(request.actionId, 'CELL_OCCUPIED', '该位置已有棋子。', false, true);
 
     const color: 1 | 2 = round.blackPlayerId === player.playerId ? 1 : 2;
     round.board[index] = color;
@@ -784,32 +873,139 @@ export function createGameServer(options: CreateGameServerOptions = {}): GameSer
     round.lastMove = { x: request.x, y: request.y, playerId: player.playerId, color, moveNo: round.moveNo };
     const winningLine = winningLineForMove(round.board, request.x, request.y, color);
     if (winningLine !== null) {
-      const loserPlayerId = round.participantIds.find((participantId) => participantId !== player.playerId) ?? null;
       round.turnPlayerId = null;
       round.result = {
         winnerPlayerId: player.playerId,
-        loserPlayerId,
+        loserPlayerId: round.participantIds.find((participantId) => participantId !== player.playerId) ?? null,
         reason: 'five',
         winningLine,
-        endedAt: Date.now(),
+        endedAt: now(),
       };
       room.state.phase = 'finished';
     } else if (isBoardFull(round.board)) {
       round.turnPlayerId = null;
-      round.result = {
-        winnerPlayerId: null,
-        loserPlayerId: null,
-        reason: 'draw',
-        winningLine: [],
-        endedAt: Date.now(),
-      };
+      round.result = { winnerPlayerId: null, loserPlayerId: null, reason: 'draw', winningLine: [], endedAt: now() };
       room.state.phase = 'finished';
     } else {
       round.turnPlayerId = round.participantIds.find((participantId) => participantId !== player.playerId) ?? null;
     }
-
     const patch = commit(room, { phase: room.state.phase, round: clone(round) }, request.actionId);
     broadcastPatch(room, patch);
+    return success(request.actionId, undefined, patch.version);
+  };
+
+  const resolveDisconnect = (socket: GameSocket, player: PlayerRecord, request: DisconnectResolveRequest): AckResult => {
+    const member = memberRoom(socket, player, request.roomInstanceId, request.actionId);
+    if (isRoomFailure(member)) return member;
+    const room = member;
+    const round = room.state.round;
+    if (room.state.phase !== 'playing' || round === null || round.roundId !== request.roundId) {
+      return failure(request.actionId, 'STALE_ROUND', '该对局已经过期。', false, true);
+    }
+    const actorSeat = seatForPlayer(room.state, player.playerId);
+    if (actorSeat === null || !actorSeat.connected || !round.participantIds.includes(player.playerId)) {
+      return failure(request.actionId, 'SEAT_RELEASED', '你不是当前在线的本局对手。');
+    }
+    const opponentId = round.participantIds.find((participantId) => participantId !== player.playerId);
+    if (opponentId === undefined || opponentId !== request.targetPlayerId) {
+      return failure(request.actionId, 'SEAT_RELEASED', '只能对本局原对手进行裁决。');
+    }
+    const targetSeat = seatForPlayer(room.state, request.targetPlayerId);
+    if (targetSeat === null || targetSeat.connected || targetSeat.disconnectedAt === null) {
+      return failure(request.actionId, 'INVALID_PHASE', '对手当前不处于可裁决的离线状态。', false, true);
+    }
+    if (now() - targetSeat.disconnectedAt < RECONNECT_GRACE_MS) {
+      return failure(request.actionId, 'GAME_PAUSED', '对手离线尚未满 60 秒。', true, true);
+    }
+    if (request.decision === 'keep_waiting') {
+      // This decision intentionally stores no grace-period reset: a later claim
+      // is still valid as soon as the same target remains offline.
+      return success(request.actionId, undefined, room.state.version);
+    }
+
+    round.turnPlayerId = null;
+    round.paused = false;
+    round.result = {
+      winnerPlayerId: player.playerId,
+      loserPlayerId: request.targetPlayerId,
+      reason: 'disconnect',
+      winningLine: [],
+      endedAt: now(),
+    };
+    room.state.phase = 'finished';
+    const targetPlayer = store.players.get(request.targetPlayerId);
+    const targetIndex = seatIndexForPlayer(room.state, request.targetPlayerId);
+    if (targetIndex !== -1) room.state.seats[targetIndex] = null;
+    if (targetPlayer?.roomInstanceId === room.state.roomInstanceId) targetPlayer.roomInstanceId = null;
+    clearReady(room.state);
+    updateNoConnectedPlayersSince(room.state, now());
+    const patch = commit(room, { phase: room.state.phase, ...roomChanges(room, true) }, request.actionId);
+    broadcastPatch(room, patch);
+    return success(request.actionId, undefined, patch.version);
+  };
+
+  const leaveRoom = async (socket: GameSocket, player: PlayerRecord, request: LeaveRequest): Promise<AckResult> => {
+    const member = memberRoom(socket, player, request.roomInstanceId, request.actionId);
+    if (isRoomFailure(member)) return member;
+    const room = member;
+    const expectedRoundId = room.state.round?.roundId ?? null;
+    if (request.roundId !== expectedRoundId) return failure(request.actionId, 'STALE_ROUND', '离开请求引用了过期对局。', false, true);
+    const leavingIndex = seatIndexForPlayer(room.state, player.playerId);
+    if (leavingIndex === -1) return failure(request.actionId, 'SEAT_RELEASED', '你的座位已失效。');
+
+    const lease = memberOperations.begin(room, player.playerId, socket.id, player.controlEpoch);
+    if (lease === null) return failure(request.actionId, 'INVALID_PHASE', '成员操作正在处理中，请稍候。', true);
+    // First remove this socket from the room group. It can never observe the
+    // patch that releases it nor any later state intended for a replacement.
+    try {
+      await socket.leave(room.state.roomInstanceId);
+    } catch {
+      const invalid = continuationFailure(socket, player, room, lease, request.actionId);
+      if (invalid === null && !socket.rooms.has(room.state.roomInstanceId)) {
+        const offlinePatch = markSeatOffline(room, player);
+        if (offlinePatch !== null) broadcastPatch(room, offlinePatch);
+      }
+      memberOperations.finish(room, player.playerId, lease);
+      if (invalid !== null) return invalid;
+      return failure(request.actionId, 'INTERNAL_ERROR', '离开房间失败。', true);
+    }
+    const invalid = continuationFailure(socket, player, room, lease, request.actionId);
+    if (invalid !== null) {
+      memberOperations.finish(room, player.playerId, lease);
+      return invalid;
+    }
+    if (request.roundId !== (room.state.round?.roundId ?? null)) {
+      const offlinePatch = markSeatOffline(room, player);
+      if (offlinePatch !== null) broadcastPatch(room, offlinePatch);
+      memberOperations.finish(room, player.playerId, lease);
+      return failure(request.actionId, 'STALE_ROUND', '离开请求引用了过期对局。', false, true);
+    }
+
+    const round = room.state.round;
+    if (room.state.phase === 'playing' && round !== null) {
+      const winnerPlayerId = round.participantIds.find((participantId) => participantId !== player.playerId) ?? null;
+      round.turnPlayerId = null;
+      round.paused = false;
+      round.result = {
+        winnerPlayerId,
+        loserPlayerId: player.playerId,
+        reason: 'resign',
+        winningLine: [],
+        endedAt: now(),
+      };
+      room.state.phase = 'finished';
+    }
+    room.state.seats[leavingIndex] = null;
+    if (player.roomInstanceId === room.state.roomInstanceId) player.roomInstanceId = null;
+    clearReady(room.state);
+    room.state.washProposal = null;
+    updateNoConnectedPlayersSince(room.state, now());
+    const patch = commit(room, {
+      ...(room.state.phase === 'playing' ? {} : { phase: room.state.phase }),
+      ...roomChanges(room, round !== null),
+    }, request.actionId);
+    broadcastPatch(room, patch);
+    memberOperations.finish(room, player.playerId, lease);
     return success(request.actionId, undefined, patch.version);
   };
 
@@ -827,28 +1023,17 @@ export function createGameServer(options: CreateGameServerOptions = {}): GameSer
     const player = store.players.get(playerId);
     if (player === undefined || player.activeSocketId !== socket.id || player.controlEpoch !== epoch) return;
     player.activeSocketId = null;
-    player.lastSeenAt = Date.now();
+    player.lastSeenAt = now();
     if (player.roomInstanceId === null) return;
     const room = store.roomsByInstance.get(player.roomInstanceId);
     if (room === undefined) return;
-    const seat = room.state.seats.find((candidate) => candidate?.playerId === player.playerId);
-    if (seat === undefined || seat === null) return;
-    seat.connected = false;
-    seat.disconnectedAt = Date.now();
-    seat.reconnectDeadline = null;
-    seat.disconnectDecisionAvailable = false;
-    let changes: RoomChanges = { seats: clone(room.state.seats) };
-    if (room.state.phase === 'playing' && room.state.round !== null) {
-      room.state.round.paused = true;
-      changes = { seats: clone(room.state.seats), round: clone(room.state.round) };
-    }
-    const patch = commit(room, changes);
-    broadcastPatch(room, patch);
+    const patch = markSeatOffline(room, player);
+    if (patch !== null) broadcastPatch(room, patch);
   };
 
   io.on('connection', (socket) => {
     const gameSocket = socket as GameSocket;
-    gameSocket.emit('server:hello', { protocolVersion: PROTOCOL_VERSION, serverEpoch, serverTime: Date.now() });
+    gameSocket.emit('server:hello', { protocolVersion: PROTOCOL_VERSION, serverEpoch, serverTime: now() });
     gameSocket.on('session:open', (request, ack) => { void handleSessionOpen(gameSocket, request, ack); });
     gameSocket.on('room:create', (request, ack) => {
       void runAuthenticated(gameSocket, 'room:create', request, ack, createSchema, (player, parsed) => createRoom(gameSocket, player, parsed));
@@ -856,8 +1041,22 @@ export function createGameServer(options: CreateGameServerOptions = {}): GameSer
     gameSocket.on('room:join', (request, ack) => {
       void runAuthenticated(gameSocket, 'room:join', request, ack, joinSchema, (player, parsed) => joinRoom(gameSocket, player, parsed));
     });
+    gameSocket.on('room:resume', (request, ack) => {
+      void runAuthenticated(
+        gameSocket,
+        'room:resume',
+        request,
+        ack,
+        resumeSchema,
+        (player, parsed) => resumeRoom(gameSocket, player, parsed),
+        (player, parsed, response) => replayCachedResume(gameSocket, player, parsed, response),
+      );
+    });
     gameSocket.on('room:sync', (request, ack) => {
       void runAuthenticated(gameSocket, 'room:sync', request, ack, syncSchema, (player, parsed) => sync(gameSocket, player, parsed));
+    });
+    gameSocket.on('room:leave', (request, ack) => {
+      void runAuthenticated(gameSocket, 'room:leave', request, ack, leaveSchema, (player, parsed) => leaveRoom(gameSocket, player, parsed));
     });
     gameSocket.on('round:ready', (request, ack) => {
       void runAuthenticated(gameSocket, 'round:ready', request, ack, readySchema, (player, parsed) => setReady(gameSocket, player, parsed));
@@ -865,15 +1064,23 @@ export function createGameServer(options: CreateGameServerOptions = {}): GameSer
     gameSocket.on('game:move', (request, ack) => {
       void runAuthenticated(gameSocket, 'game:move', request, ack, moveSchema, (player, parsed) => move(gameSocket, player, parsed));
     });
+    gameSocket.on('disconnect:resolve', (request, ack) => {
+      void runAuthenticated(gameSocket, 'disconnect:resolve', request, ack, disconnectResolveSchema, (player, parsed) => resolveDisconnect(gameSocket, player, parsed));
+    });
     gameSocket.on('disconnect', () => disconnect(gameSocket));
   });
 
+  const configuredMaintenanceInterval = options.maintenanceIntervalMs ?? 1_000;
+  const maintenanceTimer = configuredMaintenanceInterval > 0
+    ? setInterval(runMaintenance, configuredMaintenanceInterval)
+    : undefined;
+  maintenanceTimer?.unref();
+
   const close = async (): Promise<void> => {
+    if (maintenanceTimer !== undefined) clearInterval(maintenanceTimer);
     await new Promise<void>((resolve) => io.close(() => resolve()));
-    if (httpServer.listening) {
-      await new Promise<void>((resolve) => httpServer.close(() => resolve()));
-    }
+    if (httpServer.listening) await new Promise<void>((resolve) => httpServer.close(() => resolve()));
   };
 
-  return { app, httpServer, io, store, close };
+  return { app, httpServer, io, store, runMaintenance, close };
 }

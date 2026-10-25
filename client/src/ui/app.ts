@@ -10,6 +10,8 @@ export interface AppActions {
   joinRoom: (roomCode: string) => void;
   setReady: () => void;
   placeMove: (x: number, y: number) => void;
+  leaveRoom: () => void;
+  resolveDisconnect: (targetPlayerId: string, decision: 'claim_win' | 'keep_waiting') => void;
 }
 
 interface SeatNodes {
@@ -40,7 +42,12 @@ export class GameUI {
   private readonly roomCodeInput: HTMLInputElement;
   private readonly createButton: HTMLButtonElement;
   private readonly joinButton: HTMLButtonElement;
+  private readonly joinPanel: HTMLElement;
   private readonly readyButton: HTMLButtonElement;
+  private readonly leaveButton: HTMLButtonElement;
+  private readonly claimWinButton: HTMLButtonElement;
+  private readonly keepWaitingButton: HTMLButtonElement;
+  private readonly reconnectCountdown: HTMLElement;
   private readonly roomCode: HTMLElement;
   private readonly playerName: HTMLElement;
   private readonly version: HTMLElement;
@@ -58,6 +65,7 @@ export class GameUI {
   private readonly seats: SeatNodes[];
   private readonly renderer: BoardRenderer;
   private readonly unbindBoardInput: () => void;
+  private readonly clockTimer: number;
 
   private room: RoomState | null = null;
   private identity: ClientIdentity | null = null;
@@ -67,10 +75,12 @@ export class GameUI {
   private movePending = false;
   private roomFull = false;
   private synchronizing = false;
+  private restoringRoom = false;
   private invitation: string | null = null;
   private connectionText = '正在连接服务器。';
   private messageText = '';
   private serverText = '服务器：正在连接';
+  private clockOffsetMs = 0;
 
   public constructor(root: HTMLElement, private readonly actions: AppActions, initialRoomCode?: string) {
     root.innerHTML = `
@@ -80,7 +90,7 @@ export class GameUI {
             <div class="brand-mark" aria-hidden="true">●</div>
             <div><h1>同桌五子棋</h1><p>两个人，一盘认真下完的棋。</p></div>
           </div>
-          <span class="version" data-testid="room-version">M1 · v0.1.0</span>
+          <span class="version" data-testid="room-version">M2 · v0.2.0</span>
         </header>
 
         <section class="connection-strip" aria-live="polite">
@@ -92,7 +102,7 @@ export class GameUI {
         <section class="identity-panel panel">
           <div class="panel-inner">
             <h2>先留下一个昵称</h2>
-            <p>昵称只用于本次页面连接。M1 不保存身份，刷新页面后不能恢复原房间。</p>
+            <p>身份只保存在当前浏览器，用于刷新后恢复自己的座位；不需要账号。</p>
             <form class="identity-form"><div class="form-row">
               <label class="field">昵称（1–12 字符）
                 <input data-testid="nickname-input" maxlength="12" autocomplete="nickname" placeholder="例如：小林" required />
@@ -128,7 +138,7 @@ export class GameUI {
           <aside class="side-stack">
             <section class="room-card panel">
               <div class="room-meta"><span class="room-label">房间码</span><strong class="room-code" data-testid="room-code">—</strong></div>
-              <p class="player-line">你是：<strong class="own-player-name">未建立身份</strong></p>
+              <p class="player-line">你是：<strong class="own-player-name" data-testid="own-player-name">未建立身份</strong></p>
             </section>
             <section class="seat-list" aria-label="玩家座位">
               <article class="seat-card" data-seat="A">
@@ -144,9 +154,17 @@ export class GameUI {
             </section>
             <section class="turn-card">
               <strong class="turn-label">等待房间状态</strong>
+              <p class="reconnect-countdown" data-testid="reconnect-countdown" hidden></p>
               <p class="rules">规则：15×15，黑棋先手，无禁手，连续五子及以上获胜。</p>
             </section>
-            <button class="ready-button" data-testid="ready-button" type="button" hidden>准备开始</button>
+            <div class="room-actions">
+              <button class="ready-button" data-testid="ready-button" type="button" hidden>准备开始</button>
+              <button class="secondary leave-button" data-testid="leave-button" type="button" hidden>离开房间</button>
+            </div>
+            <div class="disconnect-actions" hidden>
+              <button data-testid="claim-win-button" type="button" hidden>判定获胜</button>
+              <button class="secondary" data-testid="keep-waiting-button" type="button" hidden>继续等待</button>
+            </div>
             <section class="invite-panel panel" hidden>
               <h3>邀请对方加入</h3>
               <p>可直接复制；若浏览器不允许自动复制，请手动复制下方链接。</p>
@@ -170,9 +188,14 @@ export class GameUI {
     this.roomCodeInput = required(root, '[data-testid="room-code-input"]');
     this.createButton = required(root, '[data-testid="create-room"]');
     this.joinButton = required(root, '[data-testid="join-room"]');
+    this.joinPanel = required(root, '.lobby-divider');
     this.readyButton = required(root, '[data-testid="ready-button"]');
+    this.leaveButton = required(root, '[data-testid="leave-button"]');
+    this.claimWinButton = required(root, '[data-testid="claim-win-button"]');
+    this.keepWaitingButton = required(root, '[data-testid="keep-waiting-button"]');
+    this.reconnectCountdown = required(root, '[data-testid="reconnect-countdown"]');
     this.roomCode = required(root, '[data-testid="room-code"]');
-    this.playerName = required(root, '.own-player-name');
+    this.playerName = required(root, '[data-testid="own-player-name"]');
     this.version = required(root, '[data-testid="room-version"]');
     this.currentTurn = required(root, '.turn-label');
     this.statusMessage = required(root, '[data-testid="status-message"]');
@@ -212,12 +235,16 @@ export class GameUI {
       this.actions.joinRoom(this.roomCodeInput.value.trim().toUpperCase());
     });
     this.readyButton.addEventListener('click', () => this.actions.setReady());
+    this.leaveButton.addEventListener('click', () => this.actions.leaveRoom());
+    this.claimWinButton.addEventListener('click', () => this.resolveOpponent('claim_win'));
+    this.keepWaitingButton.addEventListener('click', () => this.resolveOpponent('keep_waiting'));
     this.copyInviteButton.addEventListener('click', () => void this.copyInvitation());
 
     if (initialRoomCode) {
       this.roomCodeInput.value = initialRoomCode;
       this.messageText = '已从邀请链接填入房间码；请先建立昵称身份再加入。';
     }
+    this.clockTimer = window.setInterval(() => this.render(), 1_000);
     this.render();
   }
 
@@ -225,6 +252,13 @@ export class GameUI {
     this.identity = identity;
     this.networkReady = ready;
     if (identity) this.nicknameInput.value = identity.nickname;
+    this.render();
+  }
+
+  /** Display a saved nickname while its private credential is being verified. */
+  public setRestoringIdentity(nickname: string): void {
+    this.nicknameInput.value = nickname;
+    this.connectionText = '正在恢复本浏览器保存的身份…';
     this.render();
   }
 
@@ -237,6 +271,11 @@ export class GameUI {
     this.render();
   }
 
+  public setClockOffset(serverTime: number): void {
+    if (Number.isFinite(serverTime)) this.clockOffsetMs = serverTime - Date.now();
+    this.render();
+  }
+
   public setRoom(room: RoomState | null): void {
     const enteringPlaying = room?.phase === 'playing' && this.room?.phase !== 'playing';
     this.room = room;
@@ -244,9 +283,6 @@ export class GameUI {
     this.renderer.setRoom(room);
     this.render();
     if (enteringPlaying) {
-      // On narrow layouts the ready button sits below the canvas and browser
-      // automation/user focus may have scrolled it away. Bring the playable
-      // surface back into the viewport once the server starts the round.
       window.requestAnimationFrame(() => {
         this.boardCanvas.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'auto' });
       });
@@ -278,8 +314,13 @@ export class GameUI {
     this.render();
   }
 
-  public setInvitation(entry: RoomEntryData): void {
-    this.invitation = invitationFrom(entry.roomCode, entry.invitationPath);
+  public setRestoringRoom(restoring: boolean): void {
+    this.restoringRoom = restoring;
+    this.render();
+  }
+
+  public setInvitation(entry: RoomEntryData | null): void {
+    this.invitation = entry ? invitationFrom(entry.roomCode, entry.invitationPath) : null;
     this.render();
   }
 
@@ -304,6 +345,7 @@ export class GameUI {
   }
 
   public destroy(): void {
+    window.clearInterval(this.clockTimer);
     this.unbindBoardInput();
     this.renderer.destroy();
   }
@@ -314,27 +356,34 @@ export class GameUI {
     const invite = this.invitation ?? (roomCode ? invitationFrom(roomCode) : '');
 
     this.identityPanel.hidden = Boolean(this.identity);
-    this.lobby.hidden = Boolean(this.room);
+    this.lobby.hidden = Boolean(this.room) || this.restoringRoom;
     this.gamePanel.hidden = !this.room;
     this.fullRoomNote.hidden = !this.roomFull || Boolean(this.room);
-    this.createButton.disabled = this.roomEntryBusy || Boolean(this.room);
-    this.joinButton.disabled = this.roomEntryBusy || Boolean(this.room);
-    this.roomCodeInput.disabled = this.roomEntryBusy || Boolean(this.room);
+    this.joinPanel.hidden = this.roomFull && !this.room;
+    // A first create/join click is also the approved identity-establishment
+    // action. Once an identity exists, normal M2 network/snapshot gating
+    // applies and no room-changing intent can pass during recovery.
+    const admissionBlocked = Boolean(this.identity) && !this.networkReady;
+    this.createButton.disabled = this.roomEntryBusy || Boolean(this.room) || admissionBlocked;
+    this.joinButton.disabled = this.roomEntryBusy || Boolean(this.room) || admissionBlocked;
+    this.roomCodeInput.disabled = this.roomEntryBusy || Boolean(this.room) || admissionBlocked;
     this.createButton.textContent = this.roomFull && !this.room ? '创建新房间' : '创建房间';
     this.nicknameInput.disabled = Boolean(this.identity);
 
     this.roomCode.textContent = roomCode || '—';
     this.playerName.textContent = this.identity?.nickname ?? '未建立身份';
-    this.version.textContent = this.room ? `M1 · v0.1.0 · 状态 v${this.room.version}` : 'M1 · v0.1.0';
+    this.version.textContent = this.room ? `M2 · v0.2.0 · 状态 v${this.room.version}` : 'M2 · v0.2.0';
     this.serverStatus.textContent = this.serverText;
     this.statusMessage.textContent = this.messageText || (this.room?.phase === 'playing' ? this.turnText() : this.connectionText);
-    this.syncMessage.hidden = !this.synchronizing;
+    this.syncMessage.hidden = !this.synchronizing || this.restoringRoom;
     this.pendingMove.hidden = !this.movePending;
     this.moveCount.textContent = `第 ${this.room?.round?.moveNo ?? 0} 手 / 225`;
 
     this.renderSeats();
     this.currentTurn.textContent = this.turnText();
     this.renderReady(ownSeat);
+    this.renderLeave(ownSeat);
+    this.renderDisconnectDecision(ownSeat);
     this.invitePanel.hidden = !this.room;
     this.inviteInput.value = invite;
     this.renderResult();
@@ -347,7 +396,11 @@ export class GameUI {
       const fallbackColor = index === 0 ? '黑棋' : '白棋';
       let color = fallbackColor;
       if (seat && round) {
-        color = seat.playerId === round.blackPlayerId ? '黑棋' : seat.playerId === round.whitePlayerId ? '白棋' : '旁观座位';
+        color = !round.participantIds.includes(seat.playerId)
+          ? '等待新局'
+          : seat.playerId === round.blackPlayerId
+            ? '黑棋'
+            : '白棋';
       }
       nodes.color.textContent = color;
       nodes.name.textContent = seat?.nickname || '等待玩家';
@@ -355,15 +408,26 @@ export class GameUI {
       nodes.online.classList.toggle('offline', Boolean(seat && !seat.connected));
       nodes.ready.textContent = seat ? (seat.ready ? '已准备' : '未准备') : '等待加入';
       nodes.card.classList.toggle('seat-card--self', seat?.playerId === this.identity?.playerId);
+      if (seat) nodes.card.dataset.playerId = seat.playerId;
+      else delete nodes.card.dataset.playerId;
     });
   }
 
   private turnText(): string {
-    if (!this.room) return '等待房间状态';
+    if (!this.room) return this.restoringRoom ? '正在恢复原房间座位' : '等待房间状态';
     const round = this.room.round;
     if (!round) return '等待两位玩家准备开始';
-    if (round.paused) return '对局已暂停，等待服务器状态更新';
-    if (this.room.phase === 'finished' || round.result) return '本局已经结束';
+    const ownIsParticipant = Boolean(this.identity && round.participantIds.includes(this.identity.playerId));
+    if (round.result || this.room.phase === 'finished') {
+      return ownIsParticipant ? '本局已经结束，可以准备再来一局' : '上一局已经结束，等待新局';
+    }
+    if (round.paused) {
+      const opponentId = ownIsParticipant
+        ? round.participantIds.find((playerId) => playerId !== this.identity?.playerId)
+        : undefined;
+      const opponent = this.room.seats.find((seat) => seat?.playerId === opponentId) ?? null;
+      return opponent && !opponent.connected ? '对方掉线，等待重连' : '对局已暂停，等待服务器状态更新';
+    }
     if (this.room.phase !== 'playing' || !round.turnPlayerId) return '等待对局开始';
     const seat = this.room.seats.find((item) => item?.playerId === round.turnPlayerId) ?? null;
     const side = round.turnPlayerId === round.blackPlayerId ? '黑棋' : '白棋';
@@ -373,11 +437,66 @@ export class GameUI {
   }
 
   private renderReady(ownSeat: RoomState['seats'][number] | null): void {
-    const show = Boolean(ownSeat && this.room?.phase === 'waiting');
+    const phase = this.room?.phase;
+    const show = Boolean(ownSeat && (phase === 'waiting' || phase === 'finished'));
     this.readyButton.hidden = !show;
     if (!show) return;
-    this.readyButton.textContent = ownSeat?.ready ? '取消准备' : '准备开始';
-    this.readyButton.disabled = !this.networkReady || this.readyBusy || this.synchronizing;
+    this.readyButton.textContent = ownSeat?.ready
+      ? '取消准备'
+      : phase === 'finished'
+        ? '再来一局'
+        : '准备开始';
+    this.readyButton.disabled = !this.networkReady || this.readyBusy || this.synchronizing || this.restoringRoom;
+  }
+
+  private renderLeave(ownSeat: RoomState['seats'][number] | null): void {
+    const show = Boolean(ownSeat);
+    this.leaveButton.hidden = !show;
+    if (!show) return;
+    this.leaveButton.textContent = this.room?.phase === 'playing' ? '离开并认输' : '离开房间';
+    this.leaveButton.disabled = !this.networkReady || this.synchronizing || this.restoringRoom;
+  }
+
+  private renderDisconnectDecision(ownSeat: RoomState['seats'][number] | null): void {
+    const round = this.room?.round;
+    const ownIsParticipant = Boolean(round && this.identity && round.participantIds.includes(this.identity.playerId));
+    const opponentId = ownIsParticipant
+      ? round?.participantIds.find((playerId) => playerId !== this.identity?.playerId)
+      : undefined;
+    const opponent = this.room?.seats.find((seat) => seat?.playerId === opponentId) ?? null;
+    const waitingForOpponent = Boolean(
+      round
+      && this.room?.phase === 'playing'
+      && round.paused
+      && ownSeat?.connected
+      && opponent
+      && !opponent.connected,
+    );
+    this.reconnectCountdown.hidden = !waitingForOpponent;
+    if (waitingForOpponent) {
+      const deadline = opponent?.reconnectDeadline;
+      const seconds = typeof deadline === 'number'
+        ? Math.max(0, Math.ceil((deadline - (Date.now() + this.clockOffsetMs)) / 1_000))
+        : null;
+      this.reconnectCountdown.textContent = seconds === null
+        ? '对方掉线，等待重连。'
+        : seconds > 0
+          ? `对方掉线，等待重连（${seconds} 秒）。`
+          : '对方掉线已超过宽限期，可以判定获胜或继续等待。';
+    } else {
+      this.reconnectCountdown.textContent = '';
+    }
+
+    const graceElapsed = opponent?.reconnectDeadline !== null && opponent?.reconnectDeadline !== undefined
+      && Date.now() + this.clockOffsetMs >= opponent.reconnectDeadline;
+    const canDecide = Boolean(waitingForOpponent && opponent?.disconnectDecisionAvailable && graceElapsed);
+    const actions = this.claimWinButton.parentElement;
+    if (actions) actions.hidden = !canDecide;
+    this.claimWinButton.hidden = !canDecide;
+    this.keepWaitingButton.hidden = !canDecide;
+    const disabled = !this.networkReady || this.synchronizing || this.restoringRoom;
+    this.claimWinButton.disabled = disabled;
+    this.keepWaitingButton.disabled = disabled;
   }
 
   private renderResult(): void {
@@ -387,15 +506,18 @@ export class GameUI {
       this.resultMessage.textContent = '';
       return;
     }
+    const isParticipant = Boolean(this.identity && this.room.round?.participantIds.includes(this.identity.playerId));
     let outcome: string;
-    if (!result.winnerPlayerId || result.reason === 'draw') {
+    if (!isParticipant) {
+      outcome = '上一局已结束；你是新加入的玩家，等待新局。';
+    } else if (!result.winnerPlayerId || result.reason === 'draw') {
       outcome = '平：本局平局。';
     } else if (result.winnerPlayerId === this.identity?.playerId) {
       outcome = '胜：你赢了本局。';
     } else {
       outcome = '负：本局失利。';
     }
-    this.resultMessage.textContent = `${outcome} 画脸与再来一局将在后续里程碑开放。`;
+    this.resultMessage.textContent = `${outcome} 画脸表现将在后续里程碑开放；再战现已可用。`;
     this.resultMessage.hidden = false;
   }
 
@@ -404,6 +526,7 @@ export class GameUI {
     return Boolean(
       this.networkReady
       && !this.synchronizing
+      && !this.restoringRoom
       && !this.movePending
       && this.room?.phase === 'playing'
       && round
@@ -411,6 +534,12 @@ export class GameUI {
       && !round.result
       && round.turnPlayerId === this.identity?.playerId,
     );
+  }
+
+  private resolveOpponent(decision: 'claim_win' | 'keep_waiting'): void {
+    const round = this.room?.round;
+    const playerId = round?.participantIds.find((candidate) => candidate !== this.identity?.playerId);
+    if (playerId) this.actions.resolveDisconnect(playerId, decision);
   }
 
   private async copyInvitation(): Promise<void> {

@@ -21,13 +21,15 @@ export interface SessionOpenRequest extends ActionRequest {
   playerId?: string;
   secret?: string;
 }
-export interface SessionData { playerId: string; nickname: string; secret?: string; serverEpoch: string; serverTime: number }
+export interface SessionData { playerId: string; nickname: string; secret?: string; serverEpoch: string; serverTime: number; room?: RoomEntryData | null }
 export interface RoomEntryData { roomCode: string; roomInstanceId: string; invitationPath: string }
 export interface JoinRequest extends ActionRequest { roomCode: string }
 export interface ReadyRequest extends RoomRequest { roundId: string | null; ready: boolean }
 export interface MoveRequest extends RoundRequest { x: number; y: number; expectedMoveNo: number }
 export interface SyncRequest extends ActionRequest { roomInstanceId: string; lastVersion: number; syncRequestId: string }
-export interface ResumeRequest extends SyncRequest { roomCode: string }
+export interface ResumeRequest extends ActionRequest { roomCode: string; roomInstanceId: string; lastVersion: number; syncRequestId?: string }
+export interface LeaveRequest extends RoomRequest { roundId: string | null }
+export interface DisconnectResolveRequest extends RoundRequest { targetPlayerId: string; decision: 'claim_win' | 'keep_waiting' }
 export interface DrawingRequest extends RoundRequest { drawingId: string }
 export interface StrokeBeginRequest extends DrawingRequest { strokeId: string; colorIndex: number; startPoint: Point }
 export interface StrokePointsRequest extends DrawingRequest { strokeId: string; seq: number; points: Point[] }
@@ -40,9 +42,9 @@ export interface ClientToServerEvents {
   'room:sync': (request: SyncRequest, ack: Ack) => void;
   'round:ready': (request: ReadyRequest, ack: Ack) => void;
   'game:move': (request: MoveRequest, ack: Ack) => void;
-  'room:resume': (request: ResumeRequest, ack: Ack) => void;
-  'room:leave': (request: RoomRequest, ack: Ack) => void;
-  'disconnect:resolve': (request: RoundRequest & { targetPlayerId: string; decision: 'claim_win' | 'keep_waiting' }, ack: Ack) => void;
+  'room:resume': (request: ResumeRequest, ack: Ack<RoomEntryData>) => void;
+  'room:leave': (request: LeaveRequest, ack: Ack) => void;
+  'disconnect:resolve': (request: DisconnectResolveRequest, ack: Ack) => void;
   'stroke:begin': (request: StrokeBeginRequest, ack: Ack) => void;
   'stroke:points': (request: StrokePointsRequest, ack: Ack) => void;
   'stroke:end': (request: StrokeEndRequest, ack: Ack) => void;

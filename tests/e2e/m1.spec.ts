@@ -18,6 +18,8 @@ async function joinRoom(page: Page, code: string, nickname: string) {
 async function startRound(first: Page, second: Page) {
   await expect(first.getByTestId('player-name')).toHaveCount(2);
   await expect(second.getByTestId('player-name')).toHaveCount(2);
+  await expect(second.getByTestId('ready-button')).toBeVisible();
+  await expect(second.getByTestId('ready-button')).toBeEnabled();
   await first.getByTestId('ready-button').click();
   await second.getByTestId('ready-button').click();
   await expect(first.getByTestId('status-message')).toContainText(/轮到/);

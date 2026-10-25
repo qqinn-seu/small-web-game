@@ -106,9 +106,13 @@ button.secondary:not(:disabled):hover { background: #d6e5dc; }
 
 .turn-card { border-radius: 13px; background: #173b36; color: #f7fbf8; padding: 14px; }
 .turn-label { display: block; font-weight: 750; line-height: 1.45; }
+.reconnect-countdown { margin: 8px 0 0; color: #f7d99a; font-size: 12px; font-weight: 650; line-height: 1.5; }
 .rules { margin: 9px 0 0; color: #e0ede6; font-size: 12px; line-height: 1.55; }
+.room-actions, .disconnect-actions { display: grid; gap: 9px; }
 .ready-button { width: 100%; margin-top: 4px; }
-
+.leave-button { width: 100%; }
+.disconnect-actions { grid-template-columns: 1fr 1fr; }
+.disconnect-actions button { min-width: 0; font-size: 13px; padding-inline: 10px; }
 .board-panel { overflow: hidden; padding: 14px; }
 .board-canvas {
   display: block; width: min(100%, 680px); aspect-ratio: 1; margin: 0 auto;
@@ -147,4 +151,5 @@ button.secondary:not(:disabled):hover { background: #d6e5dc; }
   .connection-strip { align-items: flex-start; flex-direction: column; gap: 5px; }
   .sync-message { margin-left: 0; }
   .invite-row { flex-direction: column; }
+  .disconnect-actions { grid-template-columns: 1fr; }
 }
