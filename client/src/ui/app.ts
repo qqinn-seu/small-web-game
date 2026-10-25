@@ -10,9 +10,11 @@ import type {
 } from '../../../shared/protocol.js';
 import { BoardRenderer } from '../canvas/board-renderer.js';
 import { confirmedPixelCount, FaceRenderer } from '../canvas/face-renderer.js';
+import type { GameAudioState } from '../audio/types.js';
 import { DrawingController } from '../input/drawing-controller.js';
 import { bindBoardInput } from '../input/board-input.js';
 import type { ClientIdentity } from '../network/socket-client.js';
+import { CharacterPresentation } from '../presentation/character-presentation.js';
 
 export interface AppActions {
   establishIdentity: (nickname: string) => void;
@@ -29,9 +31,11 @@ export interface AppActions {
   requestDrawingSync: (reason: string) => void;
   proposeWash: () => void;
   respondWash: (proposalId: string, accept: boolean) => void;
+  toggleMute: () => void;
 }
 
 interface SeatNodes {
+  seatId: 'A' | 'B';
   card: HTMLElement;
   color: HTMLElement;
   name: HTMLElement;
@@ -39,6 +43,8 @@ interface SeatNodes {
   ready: HTMLElement;
   faceCanvas: HTMLCanvasElement;
   faceRenderer: FaceRenderer;
+  characterCanvas: HTMLCanvasElement;
+  characterState: HTMLElement;
 }
 
 function required<T extends Element>(root: ParentNode, selector: string): T {
@@ -70,10 +76,12 @@ export class GameUI {
   private readonly roomCode: HTMLElement;
   private readonly playerName: HTMLElement;
   private readonly version: HTMLElement;
+  private readonly muteButton: HTMLButtonElement;
   private readonly currentTurn: HTMLElement;
   private readonly statusMessage: HTMLElement;
   private readonly serverStatus: HTMLElement;
   private readonly syncMessage: HTMLElement;
+  private readonly wakeNotice: HTMLElement;
   private readonly pendingMove: HTMLElement;
   private readonly moveCount: HTMLElement;
   private readonly resultMessage: HTMLElement;
@@ -83,6 +91,7 @@ export class GameUI {
   private readonly boardCanvas: HTMLCanvasElement;
   private readonly boardCaption: HTMLElement;
   private readonly seats: SeatNodes[];
+  private readonly characters: CharacterPresentation;
   private readonly renderer: BoardRenderer;
   private readonly unbindBoardInput: () => void;
   private readonly drawingStage: HTMLElement;
@@ -117,6 +126,7 @@ export class GameUI {
   private clockOffsetMs = 0;
   private selectedBrushColor = 0;
   private localPreview: StoredStroke | null = null;
+  private coldStartHintVisible = true;
 
   public constructor(root: HTMLElement, private readonly actions: AppActions, initialRoomCode?: string) {
     root.innerHTML = `
@@ -126,13 +136,14 @@ export class GameUI {
             <div class="brand-mark" aria-hidden="true">●</div>
             <div><h1>同桌五子棋</h1><p>两个人，一盘认真下完的棋。</p></div>
           </div>
-          <span class="version" data-testid="room-version">M3 v0.3.0</span>
+          <div class="topbar-actions"><button class="mute-button secondary" data-testid="mute-button" type="button" aria-pressed="false" data-muted="false" data-audio-unlocked="false" data-audio-supported="false" data-played-stone="0" data-played-turn="0" data-played-win="0" data-played-lose="0" data-played-brush="0">静音</button><span class="version" data-testid="room-version">M4 v0.4.0</span></div>
         </header>
 
         <section class="connection-strip" aria-live="polite">
           <strong class="server-status">服务器：正在连接</strong>
           <span class="status-message" data-testid="status-message">正在连接服务器。</span>
           <span class="sync-message" hidden>正在同步房间状态…</span>
+          <span class="wake-note" hidden>免费 Render 首次唤醒可能需要等几十秒，请稍候。</span>
         </section>
 
         <section class="identity-panel panel">
@@ -176,16 +187,6 @@ export class GameUI {
               <div class="room-meta"><span class="room-label">房间码</span><strong class="room-code" data-testid="room-code">—</strong></div>
               <p class="player-line">你是：<strong class="own-player-name" data-testid="own-player-name">未建立身份</strong></p>
             </section>
-            <section class="seat-list" aria-label="玩家座位">
-              <article class="seat-card" data-seat="A">
-                <div class="seat-top"><span class="seat-color">黑棋</span><span class="seat-online">空位</span></div>
-                <div class="seat-person"><canvas class="face-canvas" data-testid="face-canvas" aria-label="A座玩家静态脸"></canvas><div class="seat-bottom"><strong class="seat-name" data-testid="player-name">等待玩家</strong><div class="seat-ready">未准备</div></div></div>
-              </article>
-              <article class="seat-card" data-seat="B">
-                <div class="seat-top"><span class="seat-color">白棋</span><span class="seat-online">空位</span></div>
-                <div class="seat-person"><canvas class="face-canvas" data-testid="face-canvas" aria-label="B座玩家静态脸"></canvas><div class="seat-bottom"><strong class="seat-name" data-testid="player-name">等待玩家</strong><div class="seat-ready">未准备</div></div></div>
-              </article>
-            </section>
             <section class="turn-card">
               <strong class="turn-label">等待房间状态</strong>
               <p class="reconnect-countdown" data-testid="reconnect-countdown" hidden></p>
@@ -215,6 +216,13 @@ export class GameUI {
             </section>
           </aside>
 
+          <section class="match-stage" aria-label="对局舞台">
+          <article class="seat-card character-slot character-slot--a" data-seat="A">
+            <div class="seat-top"><span class="seat-color">黑棋</span><span class="seat-online">空位</span></div>
+            <canvas class="character-canvas" data-testid="character-canvas" aria-label="A座全身像素角色"></canvas>
+            <canvas class="face-canvas face-canvas--source" data-testid="face-canvas" aria-label="A座玩家静态脸"></canvas>
+            <div class="seat-bottom"><strong class="seat-name" data-testid="player-name">等待玩家</strong><div class="seat-ready">未准备</div><span class="character-state" aria-live="polite">待机</span></div>
+          </article>
           <section class="board-panel panel">
             <canvas class="board-canvas" data-testid="board-canvas" aria-label="15乘15五子棋棋盘"></canvas>
             <div class="board-caption"><span data-testid="move-count">第 0 手 / 225</span><span class="pending-move" data-testid="pending-move" hidden>落子中</span></div>
@@ -225,6 +233,13 @@ export class GameUI {
               <p class="drawing-hint">按下后保持一笔连续绘制，松开才会提交；对方会实时看到服务器确认的笔迹。</p>
             </section>
             <p class="result-message" data-testid="result-message" hidden></p>
+          </section>
+          <article class="seat-card character-slot character-slot--b" data-seat="B">
+            <div class="seat-top"><span class="seat-color">白棋</span><span class="seat-online">空位</span></div>
+            <canvas class="character-canvas" data-testid="character-canvas" aria-label="B座全身像素角色"></canvas>
+            <canvas class="face-canvas face-canvas--source" data-testid="face-canvas" aria-label="B座玩家静态脸"></canvas>
+            <div class="seat-bottom"><strong class="seat-name" data-testid="player-name">等待玩家</strong><div class="seat-ready">未准备</div><span class="character-state" aria-live="polite">待机</span></div>
+          </article>
           </section>
         </section>
       </main>`;
@@ -246,10 +261,12 @@ export class GameUI {
     this.roomCode = required(root, '[data-testid="room-code"]');
     this.playerName = required(root, '[data-testid="own-player-name"]');
     this.version = required(root, '[data-testid="room-version"]');
+    this.muteButton = required(root, '[data-testid="mute-button"]');
     this.currentTurn = required(root, '.turn-label');
     this.statusMessage = required(root, '[data-testid="status-message"]');
     this.serverStatus = required(root, '.server-status');
     this.syncMessage = required(root, '.sync-message');
+    this.wakeNotice = required(root, '.wake-note');
     this.pendingMove = required(root, '[data-testid="pending-move"]');
     this.moveCount = required(root, '[data-testid="move-count"]');
     this.resultMessage = required(root, '[data-testid="result-message"]');
@@ -270,10 +287,11 @@ export class GameUI {
     this.washAcceptButton = required(root, '[data-testid="wash-accept"]');
     this.washRejectButton = required(root, '[data-testid="wash-reject"]');
     this.washStatus = required(root, '[data-testid="wash-status"]');
-    this.seats = ['A', 'B'].map((seatId) => {
+    this.seats = (['A', 'B'] as const).map((seatId) => {
       const card = required<HTMLElement>(root, `[data-seat="${seatId}"]`);
       const faceCanvas = required<HTMLCanvasElement>(card, '[data-testid="face-canvas"]');
       return {
+        seatId,
         card,
         color: required(card, '.seat-color'),
         name: required(card, '.seat-name'),
@@ -281,8 +299,18 @@ export class GameUI {
         ready: required(card, '.seat-ready'),
         faceCanvas,
         faceRenderer: new FaceRenderer(faceCanvas),
+        characterCanvas: required<HTMLCanvasElement>(card, '[data-testid="character-canvas"]'),
+        characterState: required(card, '.character-state'),
       };
     });
+
+    this.characters = new CharacterPresentation(this.seats.map((seat) => ({
+      seatId: seat.seatId,
+      canvas: seat.characterCanvas,
+      card: seat.card,
+      label: seat.characterState,
+      bodyAsset: seat.seatId === 'A' ? '/assets/sprites/body-a.png' : '/assets/sprites/body-b.png',
+    })));
 
     this.renderer = new BoardRenderer(this.boardCanvas);
     this.drawingRenderer = new FaceRenderer(this.drawingCanvas);
@@ -302,6 +330,7 @@ export class GameUI {
       notify: (message) => this.notify(message),
       onLocalPreview: (preview) => {
         this.localPreview = preview;
+        this.characters.setLocalPreview(preview);
         this.renderFaces();
         this.renderDrawing();
       },
@@ -325,6 +354,7 @@ export class GameUI {
     this.claimWinButton.addEventListener('click', () => this.resolveOpponent('claim_win'));
     this.keepWaitingButton.addEventListener('click', () => this.resolveOpponent('keep_waiting'));
     this.copyInviteButton.addEventListener('click', () => void this.copyInvitation());
+    this.muteButton.addEventListener('click', () => this.actions.toggleMute());
     this.brushButtons.forEach((button, index) => button.addEventListener('click', () => {
       this.selectedBrushColor = index;
       this.renderDrawing();
@@ -345,9 +375,11 @@ export class GameUI {
   public setIdentity(identity: ClientIdentity | null, ready: boolean): void {
     this.identity = identity;
     this.networkReady = ready;
+    if (ready) this.coldStartHintVisible = false;
     if (identity) this.nicknameInput.value = identity.nickname;
     this.render();
     this.drawingController.setOperational();
+    this.syncCharacterActivity();
   }
 
   /** Display a saved nickname while its private credential is being verified. */
@@ -363,8 +395,10 @@ export class GameUI {
 
   public setNetworkReady(ready: boolean): void {
     this.networkReady = ready;
+    if (ready) this.coldStartHintVisible = false;
     this.render();
     this.drawingController.setOperational();
+    this.syncCharacterActivity();
   }
 
   public setClockOffset(serverTime: number): void {
@@ -377,8 +411,10 @@ export class GameUI {
     this.room = room;
     if (room?.phase === 'playing') this.messageText = '';
     this.renderer.setRoom(room);
+    this.characters.setRoom(room);
     this.drawingController.setRoom(room);
     this.render();
+    this.syncCharacterActivity();
     if (enteringPlaying) {
       window.requestAnimationFrame(() => {
         this.boardCanvas.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'auto' });
@@ -410,12 +446,33 @@ export class GameUI {
     this.synchronizing = synchronizing;
     this.render();
     this.drawingController.setOperational();
+    this.syncCharacterActivity();
   }
 
   public setRestoringRoom(restoring: boolean): void {
     this.restoringRoom = restoring;
     this.render();
     this.drawingController.setOperational();
+    this.syncCharacterActivity();
+  }
+
+  /** Called only by the accepted contiguous live-patch path in main.ts. */
+  public onLivePatch(before: RoomState, next: RoomState): void {
+    this.characters.onLivePatch(before, next);
+  }
+
+  /** Presentation-only reflection of the parent-owned Web Audio lifecycle. */
+  public setAudioState(state: GameAudioState): void {
+    this.muteButton.textContent = state.muted ? '音效' : '静音';
+    this.muteButton.setAttribute('aria-pressed', String(state.muted));
+    this.muteButton.dataset.muted = String(state.muted);
+    this.muteButton.dataset.audioUnlocked = String(state.unlocked);
+    this.muteButton.dataset.audioSupported = String(state.supported);
+    this.muteButton.dataset.playedStone = String(state.played.stone);
+    this.muteButton.dataset.playedTurn = String(state.played.turn);
+    this.muteButton.dataset.playedWin = String(state.played.win);
+    this.muteButton.dataset.playedLose = String(state.played.lose);
+    this.muteButton.dataset.playedBrush = String(state.played.brush);
   }
 
   public setInvitation(entry: RoomEntryData | null): void {
@@ -450,6 +507,7 @@ export class GameUI {
     this.drawingController.destroy();
     this.drawingRenderer.destroy();
     this.seats.forEach((seat) => seat.faceRenderer.destroy());
+    this.characters.destroy();
   }
 
   private render(): void {
@@ -472,10 +530,11 @@ export class GameUI {
 
     this.roomCode.textContent = roomCode || '—';
     this.playerName.textContent = this.identity?.nickname ?? '未建立身份';
-    this.version.textContent = this.room ? `M3 v0.3.0 · 状态 v${this.room.version}` : 'M3 v0.3.0';
+    this.version.textContent = this.room ? `M4 v0.4.0 · 状态 v${this.room.version}` : 'M4 v0.4.0';
     this.serverStatus.textContent = this.serverText;
-    this.statusMessage.textContent = this.messageText || ((this.room?.phase === 'playing' || drawingActive) ? this.turnText() : this.connectionText);
+    this.statusMessage.textContent = this.connectionPriorityText() || this.messageText || (this.room ? this.turnText() : this.connectionText);
     this.syncMessage.hidden = !this.synchronizing || this.restoringRoom;
+    this.wakeNotice.hidden = !this.coldStartHintVisible || this.networkReady || !this.connectionText.startsWith('正在连接服务器');
     this.pendingMove.hidden = !this.movePending;
     this.moveCount.textContent = `第 ${this.room?.round?.moveNo ?? 0} 手 / 225`;
     this.boardCanvas.hidden = Boolean(drawingActive);
@@ -743,6 +802,18 @@ export class GameUI {
 
   private isDrawingOperational(): boolean {
     return this.networkReady && !this.synchronizing && !this.restoringRoom;
+  }
+
+  private syncCharacterActivity(): void {
+    this.characters.setActive(this.isDrawingOperational());
+  }
+
+  private connectionPriorityText(): string | null {
+    if (this.restoringRoom) return '正在恢复原房间座位，暂不可操作。';
+    if (this.synchronizing) return '正在同步房间状态，暂不可操作。';
+    if (this.networkReady) return null;
+    if (this.connectionText === '当前页面已停止操作。') return '此页面已被另一个标签页接管，当前页面已停止操作。';
+    return this.connectionText || '正在连接服务器。';
   }
 
   private resolveOpponent(decision: 'claim_win' | 'keep_waiting'): void {

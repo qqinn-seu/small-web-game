@@ -6,6 +6,8 @@ import { IdentityRoomStorage, type StoredRoomEntry } from './state/identity-stor
 import { RoomStore } from './state/room-store.js';
 import { GameUI } from './ui/app.js';
 import { messageForError } from './ui/error-messages.js';
+import { AudioEngine } from './audio/audio-engine.js';
+import { LiveAudioRouter } from './audio/audio-events.js';
 
 interface PendingMove {
   roundId: string;
@@ -57,6 +59,8 @@ let operationsReady = false;
 let recoveryEntry: StoredRoomEntry | null = null;
 let recoveryGeneration = 0;
 let recoverySnapshotTimer: number | null = null;
+const audio = new AudioEngine({ onStateChange: (state) => ui?.setAudioState(state) });
+const audioRouter = new LiveAudioRouter((cue) => audio.play(cue));
 
 function isOperational(): boolean {
   return operationsReady && network.isReady() && !store.isRecovering() && !store.isSynchronizing();
@@ -96,6 +100,8 @@ function persistRoomState(room: NonNullable<ReturnType<RoomStore['getState']>>, 
 }
 
 function clearRoomMirror(message?: string, clearPersistentEntry = false): void {
+  audio.stop();
+  audioRouter.reset();
   clearRecoveryTimer();
   recoveryEntry = null;
   recoveryGeneration += 1;
@@ -111,6 +117,8 @@ function clearRoomMirror(message?: string, clearPersistentEntry = false): void {
 }
 
 function clearInvalidIdentity(message: string): void {
+  audio.stop();
+  audioRouter.reset();
   queuedEntry = null;
   clearRecoveryTimer();
   persistence.clearIdentity();
@@ -125,7 +133,7 @@ function clearInvalidIdentity(message: string): void {
   ui.setRestoringRoom(false);
   ui.setIdentity(null, false);
   ui.setNetworkReady(false);
-  ui.setConnection('身份验证失败。');
+  ui.setConnection(message || '身份已失效，请重新建立昵称身份。');
   ui.notify(message);
 }
 
@@ -626,40 +634,57 @@ ui = new GameUI(root, {
   requestDrawingSync: (reason) => void syncCurrentRoom(reason),
   proposeWash: () => void proposeWash(),
   respondWash: (proposalId, accept) => void respondWash(proposalId, accept),
+  toggleMute: () => {
+    const nextMuted = !audio.getState().muted;
+    audio.setMuted(nextMuted);
+    if (!nextMuted) void audio.unlock();
+  },
 }, initialRoomCode);
+ui.setAudioState(audio.getState());
 
 network = new GomokuSocketClient({
   onConnection: (notice) => {
+    if (notice.kind !== 'connected') {
+      audio.stop();
+      audioRouter.reset();
+    }
     if (notice.kind === 'connecting') {
       operationsReady = false;
       ui.setNetworkReady(false);
+      ui.setServerStatus('服务器：正在连接');
       ui.setConnection('正在连接服务器。');
     } else if (notice.kind === 'connected') {
       operationsReady = false;
       ui.setNetworkReady(false);
+      ui.setServerStatus('服务器已连接，正在验证与同步');
       ui.setConnection(storedIdentity ? '已连接服务器，正在验证已保存身份。' : '已连接服务器，请建立昵称身份。');
     } else if (notice.kind === 'disconnected') {
       operationsReady = false;
       ui.setNetworkReady(false);
+      ui.setServerStatus('服务器：连接已中断');
       ui.setConnection('连接已断开，正在重连。恢复后会重新验证身份和房间状态。');
     } else if (notice.kind === 'offline') {
       operationsReady = false;
       ui.setNetworkReady(false);
+      ui.setServerStatus('浏览器离线');
       ui.setConnection('浏览器离线，已暂停连接；恢复网络后会自动重连。');
     } else if (notice.kind === 'connect_error') {
       operationsReady = false;
       ui.setNetworkReady(false);
+      ui.setServerStatus('服务器：连接失败，正在重试');
       ui.setConnection(`连接失败，正在重试：${notice.message}`);
     } else if (notice.kind === 'replaced') {
       operationsReady = false;
       clearRecoveryTimer();
       ui.setNetworkReady(false);
+      ui.setServerStatus('此页面已停止联机');
       ui.setConnection('当前页面已停止操作。');
       // Do not clear browser storage: the newer same-origin tab owns it.
       ui.notify('此页面已被另一个标签页接管。');
     } else if (notice.kind === 'restarting') {
       operationsReady = false;
       ui.setNetworkReady(false);
+      ui.setServerStatus('服务器正在重启');
       ui.setConnection('服务器正在重启，原房间可能无法恢复。');
       ui.notify('服务器正在重启；只有收到明确失效信息后才会清除恢复记录。');
     }
@@ -678,13 +703,26 @@ network = new GomokuSocketClient({
     const applied = store.receiveSnapshot(message);
     const room = store.getState();
     if (!applied || !room) return;
+    // Snapshots, including buffered gap recovery, establish a silent baseline.
+    audio.stop();
+    audioRouter.reset();
     const entry = persistRoomState(room, recoveryEntry?.roomInstanceId === room.roomInstanceId ? recoveryEntry : undefined);
     ui.setInvitation(entry);
     if (!store.isRecovering()) completeRecoveryFromSnapshot(room);
   },
   onPatch: (message) => {
+    const previous = store.getState();
+    const wasOperational = isOperational();
     ui.setClockOffset(message.serverTime);
     store.receivePatch(message);
+    const next = store.getState();
+    if (wasOperational && previous && next && isOperational()
+      && previous.roomInstanceId === message.roomInstanceId
+      && next.roomInstanceId === message.roomInstanceId && next.version === previous.version + 1
+      && previous.version === message.prevVersion && next.version === message.version) {
+      audioRouter.acceptPatch(previous, next, network.getIdentity()?.playerId ?? null);
+      ui.onLivePatch(previous, next);
+    }
   },
   onRoomExpired: (message) => {
     clearRoomMirror(message || '房间已失效，请创建新房间。', true);
@@ -731,10 +769,18 @@ if (storedIdentity) {
   notifyStorageFallbackIfNeeded();
 }
 
+function unlockAudioFromGesture(event: Event): void {
+  if (event.isTrusted) void audio.unlock();
+}
+document.addEventListener('pointerdown', unlockAudioFromGesture, { capture: true, passive: true });
+document.addEventListener('keydown', unlockAudioFromGesture, { capture: true });
 window.addEventListener('offline', () => network.goOffline());
 window.addEventListener('online', () => network.goOnline());
 window.addEventListener('pagehide', () => {
   // Closing/refreshing is transport disconnect only, never a business leave.
+  document.removeEventListener('pointerdown', unlockAudioFromGesture, true);
+  document.removeEventListener('keydown', unlockAudioFromGesture, true);
+  audio.destroy();
   network.destroy();
   ui.destroy();
 }, { once: true });
